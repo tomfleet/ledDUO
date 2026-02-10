@@ -1,392 +1,433 @@
-/* ESPNOW Example
-
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
-
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
-
-/*
-   This example shows how to use ESPNOW.
-   Prepare two device, one for sending ESPNOW data and another for receiving
-   ESPNOW data.
-*/
-#include <stdlib.h>
-#include <time.h>
+/* IMU + WS2812 8x8 demo (ESP32-S3 + QMI8658 + WS2812) */
+#include <math.h>
 #include <string.h>
-#include <assert.h>
 #include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
-#include "freertos/timers.h"
-#include "nvs_flash.h"
-#include "esp_random.h"
-#include "esp_event.h"
-#include "esp_netif.h"
-#include "esp_wifi.h"
+#include "freertos/task.h"
+#include "driver/i2c.h"
+#include "driver/gpio.h"
+#include "driver/rmt_tx.h"
 #include "esp_log.h"
-#include "esp_mac.h"
-#include "esp_now.h"
-#include "esp_crc.h"
-#include "espnow_example.h"
+#include "esp_timer.h"
 
-#define ESPNOW_MAXDELAY 512
+#define I2C_PORT             I2C_NUM_0
+#define I2C_SDA_GPIO         11
+#define I2C_SCL_GPIO         12
+#define I2C_FREQ_HZ          400000
 
-static const char *TAG = "espnow_example";
+#define IMU_ADDR_PRIMARY     0x6B
+#define IMU_ADDR_SECONDARY   0x6A
 
-static QueueHandle_t s_example_espnow_queue = NULL;
+#define QMI8658_REG_WHOAMI   0x00
+#define QMI8658_REG_CTRL1    0x02
+#define QMI8658_REG_CTRL2    0x03
+#define QMI8658_REG_CTRL3    0x04
+#define QMI8658_REG_CTRL7    0x08
+#define QMI8658_REG_AX_L     0x35
 
-static uint8_t s_example_broadcast_mac[ESP_NOW_ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-static uint16_t s_example_espnow_seq[EXAMPLE_ESPNOW_DATA_MAX] = { 0, 0 };
+#define LED_STRIP_GPIO       14
+#define LED_STRIP_LEN        64
+#define LED_GRID_SIZE        8
+#define LED_SERPENTINE       0
+#define TILT_INVERT_ROLL     1   /* Flip left/right if tilt feels reversed. */
+#define TILT_INVERT_PITCH    1   /* Flip up/down if tilt feels reversed. */
+#define TILT_GAIN_ROLL       0.5f /* Lower = less sensitive left/right. */
+#define TILT_GAIN_PITCH      0.75f /* Lower = less sensitive up/down. */
+#define FLOW_INPUT_SMOOTH    0.8f /* Higher = slower response to tilt changes. */
+#define FLOW_RESISTANCE      0.25f /* Higher = more drag, shorter glide. */
+#define VIRTUAL_GRID_SCALE   4.0f /* Higher = smoother sub-pixel motion. */
+#define VIRTUAL_BLOB_SCALE   1.6f /* Blob size in virtual-grid units. */
+#define LED_BRIGHTNESS_SCALE 8   /* Lower = dimmer LEDs. */
+#define WS2812_RESOLUTION_HZ 10000000
+#define WS2812_T0H_TICKS     4
+#define WS2812_T0L_TICKS     8
+#define WS2812_T1H_TICKS     7
+#define WS2812_T1L_TICKS     6
 
-static void example_espnow_deinit(example_espnow_send_param_t *send_param);
+static const char *TAG = "imu_led";
 
-/* WiFi should start before using ESPNOW */
-static void example_wifi_init(void)
+typedef struct {
+    bool imu_ok;
+    uint8_t imu_addr;
+} app_ctx_t;
+
+typedef struct {
+    uint8_t pixels[LED_STRIP_LEN * 3];
+} ws2812_strip_t;
+
+static ws2812_strip_t s_strip;
+static rmt_channel_handle_t s_rmt_chan;
+static rmt_encoder_handle_t s_rmt_encoder;
+
+static int clamp_int(int v, int lo, int hi)
 {
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK( esp_wifi_init(&cfg) );
-    ESP_ERROR_CHECK( esp_wifi_set_storage(WIFI_STORAGE_RAM) );
-    ESP_ERROR_CHECK( esp_wifi_set_mode(ESPNOW_WIFI_MODE) );
-    ESP_ERROR_CHECK( esp_wifi_start());
-    ESP_ERROR_CHECK( esp_wifi_set_channel(CONFIG_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
-
-#if CONFIG_ESPNOW_ENABLE_LONG_RANGE
-    ESP_ERROR_CHECK( esp_wifi_set_protocol(ESPNOW_WIFI_IF, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N|WIFI_PROTOCOL_LR) );
-#endif
+    if (v < lo) {
+        return lo;
+    }
+    if (v > hi) {
+        return hi;
+    }
+    return v;
 }
 
-/* ESPNOW sending or receiving callback function is called in WiFi task.
- * Users should not do lengthy operations from this task. Instead, post
- * necessary data to a queue and handle it from a lower priority task. */
-static void example_espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
+static int led_index(int x, int y)
 {
-    example_espnow_event_t evt;
-    example_espnow_event_send_cb_t *send_cb = &evt.info.send_cb;
-
-    if (tx_info == NULL) {
-        ESP_LOGE(TAG, "Send cb arg error");
-        return;
+    if (LED_SERPENTINE && (y & 1)) {
+        x = (LED_GRID_SIZE - 1) - x;
     }
-
-    evt.id = EXAMPLE_ESPNOW_SEND_CB;
-    memcpy(send_cb->mac_addr, tx_info->des_addr, ESP_NOW_ETH_ALEN);
-    send_cb->status = status;
-    if (xQueueSend(s_example_espnow_queue, &evt, ESPNOW_MAXDELAY) != pdTRUE) {
-        ESP_LOGW(TAG, "Send send queue fail");
-    }
+    return (y * LED_GRID_SIZE) + x;
 }
 
-static void example_espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len)
+static uint8_t add_u8_sat(uint8_t a, uint8_t b)
 {
-    example_espnow_event_t evt;
-    example_espnow_event_recv_cb_t *recv_cb = &evt.info.recv_cb;
-    uint8_t * mac_addr = recv_info->src_addr;
-    uint8_t * des_addr = recv_info->des_addr;
-
-    if (mac_addr == NULL || data == NULL || len <= 0) {
-        ESP_LOGE(TAG, "Receive cb arg error");
-        return;
-    }
-
-    if (IS_BROADCAST_ADDR(des_addr)) {
-        /* If added a peer with encryption before, the receive packets may be
-         * encrypted as peer-to-peer message or unencrypted over the broadcast channel.
-         * Users can check the destination address to distinguish it.
-         */
-        ESP_LOGD(TAG, "Receive broadcast ESPNOW data");
-    } else {
-        ESP_LOGD(TAG, "Receive unicast ESPNOW data");
-    }
-
-    evt.id = EXAMPLE_ESPNOW_RECV_CB;
-    memcpy(recv_cb->mac_addr, mac_addr, ESP_NOW_ETH_ALEN);
-    recv_cb->data = malloc(len);
-    if (recv_cb->data == NULL) {
-        ESP_LOGE(TAG, "Malloc receive data fail");
-        return;
-    }
-    memcpy(recv_cb->data, data, len);
-    recv_cb->data_len = len;
-    if (xQueueSend(s_example_espnow_queue, &evt, ESPNOW_MAXDELAY) != pdTRUE) {
-        ESP_LOGW(TAG, "Send receive queue fail");
-        free(recv_cb->data);
-    }
+    uint16_t sum = (uint16_t)a + (uint16_t)b;
+    return (sum > 255) ? 255 : (uint8_t)sum;
 }
 
-/* Parse received ESPNOW data. */
-int example_espnow_data_parse(uint8_t *data, uint16_t data_len, uint8_t *state, uint16_t *seq, uint32_t *magic)
+static void add_trail_bilinear(uint8_t *trail, float x, float y, float intensity)
 {
-    example_espnow_data_t *buf = (example_espnow_data_t *)data;
-    uint16_t crc, crc_cal = 0;
+    int x0 = (int)floorf(x);
+    int y0 = (int)floorf(y);
+    float fx = x - (float)x0;
+    float fy = y - (float)y0;
 
-    if (data_len < sizeof(example_espnow_data_t)) {
-        ESP_LOGE(TAG, "Receive ESPNOW data too short, len:%d", data_len);
-        return -1;
-    }
-
-    *state = buf->state;
-    *seq = buf->seq_num;
-    *magic = buf->magic;
-    crc = buf->crc;
-    buf->crc = 0;
-    crc_cal = esp_crc16_le(UINT16_MAX, (uint8_t const *)buf, data_len);
-
-    if (crc_cal == crc) {
-        return buf->type;
-    }
-
-    return -1;
-}
-
-/* Prepare ESPNOW data to be sent. */
-void example_espnow_data_prepare(example_espnow_send_param_t *send_param)
-{
-    example_espnow_data_t *buf = (example_espnow_data_t *)send_param->buffer;
-
-    assert(send_param->len >= sizeof(example_espnow_data_t));
-
-    buf->type = IS_BROADCAST_ADDR(send_param->dest_mac) ? EXAMPLE_ESPNOW_DATA_BROADCAST : EXAMPLE_ESPNOW_DATA_UNICAST;
-    buf->state = send_param->state;
-    buf->seq_num = s_example_espnow_seq[buf->type]++;
-    buf->crc = 0;
-    buf->magic = send_param->magic;
-    /* Fill all remaining bytes after the data with random values */
-    esp_fill_random(buf->payload, send_param->len - sizeof(example_espnow_data_t));
-    buf->crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)buf, send_param->len);
-}
-
-static void example_espnow_task(void *pvParameter)
-{
-    example_espnow_event_t evt;
-    uint8_t recv_state = 0;
-    uint16_t recv_seq = 0;
-    uint32_t recv_magic = 0;
-    bool is_broadcast = false;
-    int ret;
-
-    vTaskDelay(5000 / portTICK_PERIOD_MS);
-    ESP_LOGI(TAG, "Start sending broadcast data");
-
-    /* Start sending broadcast ESPNOW data. */
-    example_espnow_send_param_t *send_param = (example_espnow_send_param_t *)pvParameter;
-    if (esp_now_send(send_param->dest_mac, send_param->buffer, send_param->len) != ESP_OK) {
-        ESP_LOGE(TAG, "Send error");
-        example_espnow_deinit(send_param);
-        vTaskDelete(NULL);
-    }
-
-    while (xQueueReceive(s_example_espnow_queue, &evt, portMAX_DELAY) == pdTRUE) {
-        switch (evt.id) {
-            case EXAMPLE_ESPNOW_SEND_CB:
-            {
-                example_espnow_event_send_cb_t *send_cb = &evt.info.send_cb;
-                is_broadcast = IS_BROADCAST_ADDR(send_cb->mac_addr);
-
-                ESP_LOGD(TAG, "Send data to "MACSTR", status1: %d", MAC2STR(send_cb->mac_addr), send_cb->status);
-
-                if (is_broadcast && (send_param->broadcast == false)) {
-                    break;
-                }
-
-                if (!is_broadcast) {
-                    send_param->count--;
-                    if (send_param->count == 0) {
-                        ESP_LOGI(TAG, "Send done");
-                        example_espnow_deinit(send_param);
-                        vTaskDelete(NULL);
-                    }
-                }
-
-                /* Delay a while before sending the next data. */
-                if (send_param->delay > 0) {
-                    vTaskDelay(send_param->delay/portTICK_PERIOD_MS);
-                }
-
-                ESP_LOGI(TAG, "send data to "MACSTR"", MAC2STR(send_cb->mac_addr));
-
-                memcpy(send_param->dest_mac, send_cb->mac_addr, ESP_NOW_ETH_ALEN);
-                example_espnow_data_prepare(send_param);
-
-                /* Send the next data after the previous data is sent. */
-                if (esp_now_send(send_param->dest_mac, send_param->buffer, send_param->len) != ESP_OK) {
-                    ESP_LOGE(TAG, "Send error");
-                    example_espnow_deinit(send_param);
-                    vTaskDelete(NULL);
-                }
-                break;
+    for (int dy = 0; dy <= 1; ++dy) {
+        for (int dx = 0; dx <= 1; ++dx) {
+            int xi = x0 + dx;
+            int yi = y0 + dy;
+            if (xi < 0 || xi >= LED_GRID_SIZE || yi < 0 || yi >= LED_GRID_SIZE) {
+                continue;
             }
-            case EXAMPLE_ESPNOW_RECV_CB:
-            {
-                example_espnow_event_recv_cb_t *recv_cb = &evt.info.recv_cb;
-
-                ret = example_espnow_data_parse(recv_cb->data, recv_cb->data_len, &recv_state, &recv_seq, &recv_magic);
-                free(recv_cb->data);
-                if (ret == EXAMPLE_ESPNOW_DATA_BROADCAST) {
-                    ESP_LOGI(TAG, "Receive %dth broadcast data from: "MACSTR", len: %d", recv_seq, MAC2STR(recv_cb->mac_addr), recv_cb->data_len);
-
-                    /* If MAC address does not exist in peer list, add it to peer list. */
-                    if (esp_now_is_peer_exist(recv_cb->mac_addr) == false) {
-                        esp_now_peer_info_t *peer = malloc(sizeof(esp_now_peer_info_t));
-                        if (peer == NULL) {
-                            ESP_LOGE(TAG, "Malloc peer information fail");
-                            example_espnow_deinit(send_param);
-                            vTaskDelete(NULL);
-                        }
-                        memset(peer, 0, sizeof(esp_now_peer_info_t));
-                        peer->channel = CONFIG_ESPNOW_CHANNEL;
-                        peer->ifidx = ESPNOW_WIFI_IF;
-                        peer->encrypt = true;
-                        memcpy(peer->lmk, CONFIG_ESPNOW_LMK, ESP_NOW_KEY_LEN);
-                        memcpy(peer->peer_addr, recv_cb->mac_addr, ESP_NOW_ETH_ALEN);
-                        ESP_ERROR_CHECK( esp_now_add_peer(peer) );
-                        free(peer);
-                    }
-
-                    /* Indicates that the device has received broadcast ESPNOW data. */
-                    if (send_param->state == 0) {
-                        send_param->state = 1;
-                    }
-
-                    /* If receive broadcast ESPNOW data which indicates that the other device has received
-                     * broadcast ESPNOW data and the local magic number is bigger than that in the received
-                     * broadcast ESPNOW data, stop sending broadcast ESPNOW data and start sending unicast
-                     * ESPNOW data.
-                     */
-                    if (recv_state == 1) {
-                        /* The device which has the bigger magic number sends ESPNOW data, the other one
-                         * receives ESPNOW data.
-                         */
-                        if (send_param->unicast == false && send_param->magic >= recv_magic) {
-                    	    ESP_LOGI(TAG, "Start sending unicast data");
-                    	    ESP_LOGI(TAG, "send data to "MACSTR"", MAC2STR(recv_cb->mac_addr));
-
-                    	    /* Start sending unicast ESPNOW data. */
-                            memcpy(send_param->dest_mac, recv_cb->mac_addr, ESP_NOW_ETH_ALEN);
-                            example_espnow_data_prepare(send_param);
-                            if (esp_now_send(send_param->dest_mac, send_param->buffer, send_param->len) != ESP_OK) {
-                                ESP_LOGE(TAG, "Send error");
-                                example_espnow_deinit(send_param);
-                                vTaskDelete(NULL);
-                            }
-                            else {
-                                send_param->broadcast = false;
-                                send_param->unicast = true;
-                            }
-                        }
-                    }
-                }
-                else if (ret == EXAMPLE_ESPNOW_DATA_UNICAST) {
-                    ESP_LOGI(TAG, "Receive %dth unicast data from: "MACSTR", len: %d", recv_seq, MAC2STR(recv_cb->mac_addr), recv_cb->data_len);
-
-                    /* If receive unicast ESPNOW data, also stop sending broadcast ESPNOW data. */
-                    send_param->broadcast = false;
-                }
-                else {
-                    ESP_LOGI(TAG, "Receive error data from: "MACSTR"", MAC2STR(recv_cb->mac_addr));
-                }
-                break;
+            float wx = dx ? fx : (1.0f - fx);
+            float wy = dy ? fy : (1.0f - fy);
+            float w = wx * wy;
+            uint8_t add = (uint8_t)lrintf(intensity * w);
+            if (add == 0) {
+                continue;
             }
-            default:
-                ESP_LOGE(TAG, "Callback type error: %d", evt.id);
-                break;
+            int idx = led_index(xi, yi);
+            trail[idx] = add_u8_sat(trail[idx], add);
         }
     }
 }
 
-static esp_err_t example_espnow_init(void)
+static void add_trail_blob_virtual(uint8_t *trail, float vx, float vy, float intensity)
 {
-    example_espnow_send_param_t *send_param;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            float ox = (float)dx * VIRTUAL_BLOB_SCALE;
+            float oy = (float)dy * VIRTUAL_BLOB_SCALE;
+            float dist = sqrtf((ox * ox) + (oy * oy));
+            float w = 1.0f - (dist / (VIRTUAL_BLOB_SCALE * 1.5f));
+            if (w <= 0.0f) {
+                continue;
+            }
+            float x = (vx + ox) / VIRTUAL_GRID_SCALE;
+            float y = (vy + oy) / VIRTUAL_GRID_SCALE;
+            add_trail_bilinear(trail, x, y, intensity * w);
+        }
+    }
+}
 
-    s_example_espnow_queue = xQueueCreate(ESPNOW_QUEUE_SIZE, sizeof(example_espnow_event_t));
-    if (s_example_espnow_queue == NULL) {
-        ESP_LOGE(TAG, "Create queue fail");
+static void ws2812_init(void)
+{
+    rmt_tx_channel_config_t tx_cfg = {
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .gpio_num = LED_STRIP_GPIO,
+        .mem_block_symbols = 64,
+        .resolution_hz = WS2812_RESOLUTION_HZ,
+        .trans_queue_depth = 4,
+    };
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_cfg, &s_rmt_chan));
+
+    rmt_bytes_encoder_config_t enc_cfg = {
+        .bit0 = {
+            .level0 = 1,
+            .duration0 = WS2812_T0H_TICKS,
+            .level1 = 0,
+            .duration1 = WS2812_T0L_TICKS,
+        },
+        .bit1 = {
+            .level0 = 1,
+            .duration0 = WS2812_T1H_TICKS,
+            .level1 = 0,
+            .duration1 = WS2812_T1L_TICKS,
+        },
+        .flags.msb_first = 1,
+    };
+    ESP_ERROR_CHECK(rmt_new_bytes_encoder(&enc_cfg, &s_rmt_encoder));
+    ESP_ERROR_CHECK(rmt_enable(s_rmt_chan));
+}
+
+static void ws2812_set_pixel(ws2812_strip_t *strip, int index, uint8_t r, uint8_t g, uint8_t b)
+{
+    if (index < 0 || index >= LED_STRIP_LEN) {
+        return;
+    }
+    if (LED_BRIGHTNESS_SCALE < 255) {
+        r = (uint8_t)((r * LED_BRIGHTNESS_SCALE) / 255);
+        g = (uint8_t)((g * LED_BRIGHTNESS_SCALE) / 255);
+        b = (uint8_t)((b * LED_BRIGHTNESS_SCALE) / 255);
+    }
+    int base = index * 3;
+    strip->pixels[base + 0] = g;
+    strip->pixels[base + 1] = r;
+    strip->pixels[base + 2] = b;
+}
+
+static void ws2812_clear(ws2812_strip_t *strip)
+{
+    memset(strip->pixels, 0, sizeof(strip->pixels));
+}
+
+static void ws2812_show(ws2812_strip_t *strip)
+{
+    rmt_transmit_config_t tx_cfg = {
+        .loop_count = 0,
+    };
+    esp_err_t err = rmt_transmit(s_rmt_chan, s_rmt_encoder, strip->pixels,
+                                 sizeof(strip->pixels), &tx_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "RMT transmit failed: 0x%x", err);
+        return;
+    }
+
+    err = rmt_tx_wait_all_done(s_rmt_chan, pdMS_TO_TICKS(200));
+    if (err == ESP_ERR_TIMEOUT) {
+        ESP_LOGW(TAG, "RMT flush timeout, resetting channel");
+        rmt_disable(s_rmt_chan);
+        rmt_enable(s_rmt_chan);
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "RMT wait failed: 0x%x", err);
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(1));
+}
+
+static void hsv_to_rgb(uint8_t h, uint8_t s, uint8_t v, uint8_t *r, uint8_t *g, uint8_t *b)
+{
+    uint8_t region = h / 43;
+    uint8_t remainder = (h - (region * 43)) * 6;
+
+    uint8_t p = (uint8_t)((v * (255 - s)) >> 8);
+    uint8_t q = (uint8_t)((v * (255 - ((s * remainder) >> 8))) >> 8);
+    uint8_t t = (uint8_t)((v * (255 - ((s * (255 - remainder)) >> 8))) >> 8);
+
+    switch (region) {
+        case 0: *r = v; *g = t; *b = p; break;
+        case 1: *r = q; *g = v; *b = p; break;
+        case 2: *r = p; *g = v; *b = t; break;
+        case 3: *r = p; *g = q; *b = v; break;
+        case 4: *r = t; *g = p; *b = v; break;
+        default: *r = v; *g = p; *b = q; break;
+    }
+}
+
+static esp_err_t i2c_write_reg(uint8_t addr, uint8_t reg, uint8_t value)
+{
+    uint8_t data[2] = { reg, value };
+    return i2c_master_write_to_device(I2C_PORT, addr, data, sizeof(data), pdMS_TO_TICKS(100));
+}
+
+static esp_err_t i2c_read_reg(uint8_t addr, uint8_t reg, uint8_t *data, size_t len)
+{
+    return i2c_master_write_read_device(I2C_PORT, addr, &reg, 1, data, len, pdMS_TO_TICKS(100));
+}
+
+static esp_err_t qmi8658_init(uint8_t addr, uint8_t *whoami)
+{
+    if (i2c_read_reg(addr, QMI8658_REG_WHOAMI, whoami, 1) != ESP_OK) {
         return ESP_FAIL;
     }
 
-    /* Initialize ESPNOW and register sending and receiving callback function. */
-    ESP_ERROR_CHECK( esp_now_init() );
-    ESP_ERROR_CHECK( esp_now_register_send_cb(example_espnow_send_cb) );
-    ESP_ERROR_CHECK( esp_now_register_recv_cb(example_espnow_recv_cb) );
-#if CONFIG_ESPNOW_ENABLE_POWER_SAVE
-    ESP_ERROR_CHECK( esp_now_set_wake_window(CONFIG_ESPNOW_WAKE_WINDOW) );
-    ESP_ERROR_CHECK( esp_wifi_connectionless_module_set_wake_interval(CONFIG_ESPNOW_WAKE_INTERVAL) );
-#endif
-    /* Set primary master key. */
-    ESP_ERROR_CHECK( esp_now_set_pmk((uint8_t *)CONFIG_ESPNOW_PMK) );
-
-    /* Add broadcast peer information to peer list. */
-    esp_now_peer_info_t *peer = malloc(sizeof(esp_now_peer_info_t));
-    if (peer == NULL) {
-        ESP_LOGE(TAG, "Malloc peer information fail");
-        vQueueDelete(s_example_espnow_queue);
-        s_example_espnow_queue = NULL;
-        esp_now_deinit();
-        return ESP_FAIL;
-    }
-    memset(peer, 0, sizeof(esp_now_peer_info_t));
-    peer->channel = CONFIG_ESPNOW_CHANNEL;
-    peer->ifidx = ESPNOW_WIFI_IF;
-    peer->encrypt = false;
-    memcpy(peer->peer_addr, s_example_broadcast_mac, ESP_NOW_ETH_ALEN);
-    ESP_ERROR_CHECK( esp_now_add_peer(peer) );
-    free(peer);
-
-    /* Initialize sending parameters. */
-    send_param = malloc(sizeof(example_espnow_send_param_t));
-    if (send_param == NULL) {
-        ESP_LOGE(TAG, "Malloc send parameter fail");
-        vQueueDelete(s_example_espnow_queue);
-        s_example_espnow_queue = NULL;
-        esp_now_deinit();
-        return ESP_FAIL;
-    }
-    memset(send_param, 0, sizeof(example_espnow_send_param_t));
-    send_param->unicast = false;
-    send_param->broadcast = true;
-    send_param->state = 0;
-    send_param->magic = esp_random();
-    send_param->count = CONFIG_ESPNOW_SEND_COUNT;
-    send_param->delay = CONFIG_ESPNOW_SEND_DELAY;
-    send_param->len = CONFIG_ESPNOW_SEND_LEN;
-    send_param->buffer = malloc(CONFIG_ESPNOW_SEND_LEN);
-    if (send_param->buffer == NULL) {
-        ESP_LOGE(TAG, "Malloc send buffer fail");
-        free(send_param);
-        vQueueDelete(s_example_espnow_queue);
-        s_example_espnow_queue = NULL;
-        esp_now_deinit();
-        return ESP_FAIL;
-    }
-    memcpy(send_param->dest_mac, s_example_broadcast_mac, ESP_NOW_ETH_ALEN);
-    example_espnow_data_prepare(send_param);
-
-    xTaskCreate(example_espnow_task, "example_espnow_task", 2048, send_param, 4, NULL);
-
+    /* Minimal init: enable accel + gyro. Adjust if your module needs different settings. */
+    ESP_ERROR_CHECK(i2c_write_reg(addr, QMI8658_REG_CTRL1, 0x60));
+    ESP_ERROR_CHECK(i2c_write_reg(addr, QMI8658_REG_CTRL2, 0x23));
+    ESP_ERROR_CHECK(i2c_write_reg(addr, QMI8658_REG_CTRL3, 0x23));
+    ESP_ERROR_CHECK(i2c_write_reg(addr, QMI8658_REG_CTRL7, 0x03));
+    vTaskDelay(pdMS_TO_TICKS(20));
     return ESP_OK;
 }
 
-static void example_espnow_deinit(example_espnow_send_param_t *send_param)
+static esp_err_t qmi8658_read_raw(uint8_t addr, int16_t *ax, int16_t *ay, int16_t *az,
+                                  int16_t *gx, int16_t *gy, int16_t *gz)
 {
-    free(send_param->buffer);
-    free(send_param);
-    vQueueDelete(s_example_espnow_queue);
-    s_example_espnow_queue = NULL;
-    esp_now_deinit();
+    uint8_t data[12] = {0};
+    if (i2c_read_reg(addr, QMI8658_REG_AX_L, data, sizeof(data)) != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    *ax = (int16_t)((data[1] << 8) | data[0]);
+    *ay = (int16_t)((data[3] << 8) | data[2]);
+    *az = (int16_t)((data[5] << 8) | data[4]);
+    *gx = (int16_t)((data[7] << 8) | data[6]);
+    *gy = (int16_t)((data[9] << 8) | data[8]);
+    *gz = (int16_t)((data[11] << 8) | data[10]);
+    return ESP_OK;
+}
+
+static void render_frame(app_ctx_t *ctx, int16_t ax, int16_t ay, int16_t az,
+                         int16_t gx, int16_t gy, int16_t gz, int64_t t_us)
+{
+    static float pos_x = 3.5f;
+    static float pos_y = 3.5f;
+    static float vel_x = 0.0f;
+    static float vel_y = 0.0f;
+    static uint8_t trail[LED_STRIP_LEN] = {0};
+
+    float fax = (float)ax;
+    float fay = (float)ay;
+    float faz = (float)az;
+
+    float roll = atan2f(fay, faz);
+    float pitch = atan2f(-fax, sqrtf((fay * fay) + (faz * faz)));
+
+    float roll_norm = roll / (float)(M_PI / 2.0f);
+    float pitch_norm = pitch / (float)(M_PI / 2.0f);
+    if (roll_norm > 1.0f) roll_norm = 1.0f;
+    if (roll_norm < -1.0f) roll_norm = -1.0f;
+    if (pitch_norm > 1.0f) pitch_norm = 1.0f;
+    if (pitch_norm < -1.0f) pitch_norm = -1.0f;
+
+    if (TILT_INVERT_ROLL) {
+        roll_norm = -roll_norm;
+    }
+    if (TILT_INVERT_PITCH) {
+        pitch_norm = -pitch_norm;
+    }
+
+    roll_norm *= TILT_GAIN_ROLL;
+    pitch_norm *= TILT_GAIN_PITCH;
+    if (roll_norm > 1.0f) roll_norm = 1.0f;
+    if (roll_norm < -1.0f) roll_norm = -1.0f;
+    if (pitch_norm > 1.0f) pitch_norm = 1.0f;
+    if (pitch_norm < -1.0f) pitch_norm = -1.0f;
+
+    float mag = sqrtf((roll_norm * roll_norm) + (pitch_norm * pitch_norm));
+    if (mag > 1.0f) {
+        mag = 1.0f;
+    }
+
+    float speed = 0.06f + (0.45f * mag);
+    vel_x = (vel_x * FLOW_INPUT_SMOOTH) + (roll_norm * speed);
+    vel_y = (vel_y * FLOW_INPUT_SMOOTH) + (pitch_norm * speed);
+    vel_x *= (1.0f - FLOW_RESISTANCE);
+    vel_y *= (1.0f - FLOW_RESISTANCE);
+
+    pos_x += vel_x;
+    pos_y += vel_y;
+
+    if (pos_x < 0.0f) { pos_x = 0.0f; vel_x *= -0.6f; }
+    if (pos_x > (LED_GRID_SIZE - 1)) { pos_x = (LED_GRID_SIZE - 1); vel_x *= -0.6f; }
+    if (pos_y < 0.0f) { pos_y = 0.0f; vel_y *= -0.6f; }
+    if (pos_y > (LED_GRID_SIZE - 1)) { pos_y = (LED_GRID_SIZE - 1); vel_y *= -0.6f; }
+
+    for (int i = 0; i < LED_STRIP_LEN; ++i) {
+        trail[i] = (uint8_t)((trail[i] * 220) / 255);
+    }
+
+    float vpos_x = pos_x * VIRTUAL_GRID_SCALE;
+    float vpos_y = pos_y * VIRTUAL_GRID_SCALE;
+    float vtail_x = (pos_x - (vel_x * 2.0f)) * VIRTUAL_GRID_SCALE;
+    float vtail_y = (pos_y - (vel_y * 2.0f)) * VIRTUAL_GRID_SCALE;
+    add_trail_blob_virtual(trail, vpos_x, vpos_y, 220.0f);
+    add_trail_blob_virtual(trail, vtail_x, vtail_y, 120.0f);
+
+    uint8_t base_hue = (uint8_t)((t_us / 12000) & 0xFF);
+    for (int y = 0; y < LED_GRID_SIZE; ++y) {
+        for (int x = 0; x < LED_GRID_SIZE; ++x) {
+            int idx = led_index(x, y);
+            uint8_t v = trail[idx];
+            uint8_t r = 0, g = 0, b = 0;
+            uint8_t hue = (uint8_t)(base_hue + (x * 8) + (y * 6));
+            hsv_to_rgb(hue, 255, v, &r, &g, &b);
+            ws2812_set_pixel(&s_strip, idx, r, g, b);
+        }
+    }
+
+    ws2812_show(&s_strip);
+}
+
+static void render_demo(app_ctx_t *ctx, int64_t t_us)
+{
+    float t = (float)t_us / 1000000.0f;
+    int x = (int)lrintf((sinf(t * 1.4f) * 3.5f) + 3.5f);
+    int y = (int)lrintf((cosf(t * 1.1f) * 3.5f) + 3.5f);
+    x = clamp_int(x, 0, LED_GRID_SIZE - 1);
+    y = clamp_int(y, 0, LED_GRID_SIZE - 1);
+
+    uint8_t r = 0, g = 0, b = 0;
+    uint8_t hue = (uint8_t)((t_us / 8000) & 0xFF);
+    hsv_to_rgb(hue, 255, 200, &r, &g, &b);
+
+    for (int i = 0; i < LED_STRIP_LEN; ++i) {
+        ws2812_set_pixel(&s_strip, i, 2, 1, 4);
+    }
+
+    ws2812_set_pixel(&s_strip, led_index(x, y), r, g, b);
+    ws2812_show(&s_strip);
+}
+
+static void imu_led_task(void *pv)
+{
+    app_ctx_t *ctx = (app_ctx_t *)pv;
+    while (true) {
+        int16_t ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
+        int64_t now = esp_timer_get_time();
+
+        if (ctx->imu_ok && qmi8658_read_raw(ctx->imu_addr, &ax, &ay, &az, &gx, &gy, &gz) == ESP_OK) {
+            render_frame(ctx, ax, ay, az, gx, gy, gz, now);
+        } else {
+            render_demo(ctx, now);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
 }
 
 void app_main(void)
 {
-    // Initialize NVS
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK( nvs_flash_erase() );
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK( ret );
+    gpio_config_t gpio_cfg = {
+        .pin_bit_mask = 1ULL << LED_STRIP_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&gpio_cfg));
+    ESP_ERROR_CHECK(gpio_set_level(LED_STRIP_GPIO, 0));
+    vTaskDelay(pdMS_TO_TICKS(50));
 
-    example_wifi_init();
-    example_espnow_init();
+    i2c_config_t i2c_cfg = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_SDA_GPIO,
+        .scl_io_num = I2C_SCL_GPIO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_FREQ_HZ,
+    };
+    ESP_ERROR_CHECK(i2c_param_config(I2C_PORT, &i2c_cfg));
+    ESP_ERROR_CHECK(i2c_driver_install(I2C_PORT, i2c_cfg.mode, 0, 0, 0));
+
+    uint8_t whoami = 0;
+    uint8_t imu_addr = IMU_ADDR_PRIMARY;
+    bool imu_ok = (qmi8658_init(imu_addr, &whoami) == ESP_OK);
+    if (!imu_ok) {
+        imu_addr = IMU_ADDR_SECONDARY;
+        imu_ok = (qmi8658_init(imu_addr, &whoami) == ESP_OK);
+    }
+    ESP_LOGI(TAG, "IMU %s at 0x%02X (WHOAMI=0x%02X)", imu_ok ? "found" : "not found", imu_addr, whoami);
+
+    ws2812_init();
+    ws2812_clear(&s_strip);
+    ws2812_show(&s_strip);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    ws2812_show(&s_strip);
+
+    static app_ctx_t ctx = {0};
+    ctx.imu_ok = imu_ok;
+    ctx.imu_addr = imu_addr;
+
+    xTaskCreate(imu_led_task, "imu_led_task", 4096, &ctx, 5, NULL);
 }

@@ -3,7 +3,7 @@
   "idf.openOcdConfigs": [
     "board/esp32s3-builtin.cfg"
   ],
-  "idf.portWin": "detect",
+  "idf.portWin": "COM17",
   "idf.currentSetup": "D:\\dev\\esp\\sdk\\v5.5\\esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
@@ -13,5 +13,7 @@
     "--background-index",
     "--query-driver=**",
     "--compile-commands-dir=d:\\dev\\esp\\fun\\leDUO\\leDUO_1\\build"
-  ]
+  ],
+  "idf.flashType": "UART",
+  "idf.monitorPort": "COM17"
 }
