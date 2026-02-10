@@ -8,6 +8,12 @@
 #include "driver/rmt_tx.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
+#include "esp_now.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 #define I2C_PORT             I2C_NUM_0
 #define I2C_SDA_GPIO         11
@@ -37,6 +43,14 @@
 #define VIRTUAL_GRID_SCALE   4.0f /* Higher = smoother sub-pixel motion. */
 #define VIRTUAL_BLOB_SCALE   1.6f /* Blob size in virtual-grid units. */
 #define LED_BRIGHTNESS_SCALE 8   /* Lower = dimmer LEDs. */
+#define ESPNOW_CHANNEL       1   /* Must match on both boards. */
+#define ESPNOW_SEND_INTERVAL_MS 40
+#define ESPNOW_PAIR_WINDOW_MS 6000
+#define ESPNOW_HELLO_INTERVAL_MS 300
+#define ESPNOW_REMOTE_TIMEOUT_MS 800
+#define ESPNOW_REMOTE_DIM    130 /* 0-255, lower = dimmer remote trail. */
+#define ESPNOW_MSG_HELLO     1
+#define ESPNOW_MSG_DATA      2
 #define WS2812_RESOLUTION_HZ 10000000
 #define WS2812_T0H_TICKS     4
 #define WS2812_T0L_TICKS     8
@@ -57,6 +71,34 @@ typedef struct {
 static ws2812_strip_t s_strip;
 static rmt_channel_handle_t s_rmt_chan;
 static rmt_encoder_handle_t s_rmt_encoder;
+
+typedef struct __attribute__((packed)) {
+    uint8_t version;
+    uint8_t msg_type;
+    uint8_t vpos_x;
+    uint8_t vpos_y;
+    uint8_t hue;
+} imu_led_packet_t;
+
+typedef struct {
+    bool has_peer;
+    bool pairing_active;
+    int64_t pairing_start_us;
+    int64_t last_hello_us;
+    bool broadcast_added;
+    uint8_t peer_mac[ESP_NOW_ETH_ALEN];
+    bool has_remote;
+    uint8_t remote_vpos_x;
+    uint8_t remote_vpos_y;
+    uint8_t remote_hue;
+    int64_t remote_rx_time_us;
+} espnow_state_t;
+
+static espnow_state_t s_espnow;
+static uint8_t s_local_vpos_x;
+static uint8_t s_local_vpos_y;
+static uint8_t s_local_hue;
+static const uint8_t s_broadcast_mac[ESP_NOW_ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 
 static int clamp_int(int v, int lo, int hi)
 {
@@ -205,6 +247,149 @@ static void ws2812_show(ws2812_strip_t *strip)
     vTaskDelay(pdMS_TO_TICKS(1));
 }
 
+static esp_err_t load_peer_mac_from_nvs(uint8_t *mac_out)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("pairing", NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+    size_t len = ESP_NOW_ETH_ALEN;
+    err = nvs_get_blob(handle, "peer_mac", mac_out, &len);
+    nvs_close(handle);
+    if (err != ESP_OK || len != ESP_NOW_ETH_ALEN) {
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t save_peer_mac_to_nvs(const uint8_t *mac)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("pairing", NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_blob(handle, "peer_mac", mac, ESP_NOW_ETH_ALEN);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
+
+static bool mac_equal(const uint8_t *a, const uint8_t *b)
+{
+    return memcmp(a, b, ESP_NOW_ETH_ALEN) == 0;
+}
+
+static bool pair_with_sender(const uint8_t *mac)
+{
+    memcpy(s_espnow.peer_mac, mac, ESP_NOW_ETH_ALEN);
+    esp_now_peer_info_t peer = {0};
+    peer.channel = ESPNOW_CHANNEL;
+    peer.ifidx = ESP_IF_WIFI_STA;
+    peer.encrypt = false;
+    memcpy(peer.peer_addr, s_espnow.peer_mac, ESP_NOW_ETH_ALEN);
+    if (esp_now_add_peer(&peer) != ESP_OK) {
+        return false;
+    }
+    s_espnow.has_peer = true;
+    s_espnow.pairing_active = false;
+    save_peer_mac_to_nvs(s_espnow.peer_mac);
+    ESP_LOGI(TAG, "Paired with %02X:%02X:%02X:%02X:%02X:%02X",
+             s_espnow.peer_mac[0], s_espnow.peer_mac[1], s_espnow.peer_mac[2],
+             s_espnow.peer_mac[3], s_espnow.peer_mac[4], s_espnow.peer_mac[5]);
+    return true;
+}
+
+static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len)
+{
+    if (recv_info == NULL || data == NULL || len < (int)sizeof(imu_led_packet_t)) {
+        return;
+    }
+    const imu_led_packet_t *pkt = (const imu_led_packet_t *)data;
+    if (pkt->version != 1) {
+        return;
+    }
+    bool from_peer = s_espnow.has_peer && mac_equal(recv_info->src_addr, s_espnow.peer_mac);
+    if (pkt->msg_type == ESPNOW_MSG_HELLO) {
+        if (!s_espnow.has_peer) {
+            pair_with_sender(recv_info->src_addr);
+        }
+        return;
+    }
+
+    if (pkt->msg_type == ESPNOW_MSG_DATA) {
+        if (!s_espnow.has_peer) {
+            if (!pair_with_sender(recv_info->src_addr)) {
+                return;
+            }
+            from_peer = true;
+        }
+        if (!from_peer) {
+            return;
+        }
+        s_espnow.remote_vpos_x = pkt->vpos_x;
+        s_espnow.remote_vpos_y = pkt->vpos_y;
+        s_espnow.remote_hue = pkt->hue;
+        s_espnow.remote_rx_time_us = esp_timer_get_time();
+        s_espnow.has_remote = true;
+    }
+}
+
+static esp_err_t add_broadcast_peer(void)
+{
+    esp_now_peer_info_t peer = {0};
+    peer.channel = ESPNOW_CHANNEL;
+    peer.ifidx = ESP_IF_WIFI_STA;
+    peer.encrypt = false;
+    memcpy(peer.peer_addr, s_broadcast_mac, ESP_NOW_ETH_ALEN);
+    esp_err_t err = esp_now_add_peer(&peer);
+    if (err == ESP_OK || err == ESP_ERR_ESPNOW_EXIST) {
+        s_espnow.broadcast_added = true;
+        return ESP_OK;
+    }
+    return err;
+}
+
+static esp_err_t espnow_init(void)
+{
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
+
+    ESP_ERROR_CHECK(esp_now_init());
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
+
+    if (load_peer_mac_from_nvs(s_espnow.peer_mac) == ESP_OK) {
+        esp_now_peer_info_t peer = {0};
+        peer.channel = ESPNOW_CHANNEL;
+        peer.ifidx = ESP_IF_WIFI_STA;
+        peer.encrypt = false;
+        memcpy(peer.peer_addr, s_espnow.peer_mac, ESP_NOW_ETH_ALEN);
+        ESP_ERROR_CHECK(esp_now_add_peer(&peer));
+        s_espnow.has_peer = true;
+        ESP_LOGI(TAG, "ESP-NOW peer loaded: %02X:%02X:%02X:%02X:%02X:%02X",
+                 s_espnow.peer_mac[0], s_espnow.peer_mac[1], s_espnow.peer_mac[2],
+                 s_espnow.peer_mac[3], s_espnow.peer_mac[4], s_espnow.peer_mac[5]);
+    } else {
+        s_espnow.has_peer = false;
+        s_espnow.pairing_active = true;
+        s_espnow.pairing_start_us = esp_timer_get_time();
+        s_espnow.last_hello_us = 0;
+        add_broadcast_peer();
+        ESP_LOGW(TAG, "No ESP-NOW peer in NVS; pairing window open.");
+    }
+
+    return ESP_OK;
+}
+
 static void hsv_to_rgb(uint8_t h, uint8_t s, uint8_t v, uint8_t *r, uint8_t *g, uint8_t *b)
 {
     uint8_t region = h / 43;
@@ -331,10 +516,28 @@ static void render_frame(app_ctx_t *ctx, int16_t ax, int16_t ay, int16_t az,
     float vpos_y = pos_y * VIRTUAL_GRID_SCALE;
     float vtail_x = (pos_x - (vel_x * 2.0f)) * VIRTUAL_GRID_SCALE;
     float vtail_y = (pos_y - (vel_y * 2.0f)) * VIRTUAL_GRID_SCALE;
+    s_local_vpos_x = (uint8_t)clamp_int((int)lrintf(vpos_x), 0,
+                                        (int)lrintf((LED_GRID_SIZE - 1) * VIRTUAL_GRID_SCALE));
+    s_local_vpos_y = (uint8_t)clamp_int((int)lrintf(vpos_y), 0,
+                                        (int)lrintf((LED_GRID_SIZE - 1) * VIRTUAL_GRID_SCALE));
+    s_local_hue = (uint8_t)((t_us / 12000) & 0xFF);
     add_trail_blob_virtual(trail, vpos_x, vpos_y, 220.0f);
     add_trail_blob_virtual(trail, vtail_x, vtail_y, 120.0f);
 
-    uint8_t base_hue = (uint8_t)((t_us / 12000) & 0xFF);
+    if (s_espnow.has_remote) {
+        int64_t age_ms = (t_us - s_espnow.remote_rx_time_us) / 1000;
+        if (age_ms < ESPNOW_REMOTE_TIMEOUT_MS) {
+            float fade = 1.0f - ((float)age_ms / (float)ESPNOW_REMOTE_TIMEOUT_MS);
+            float dim = (ESPNOW_REMOTE_DIM / 255.0f) * fade;
+            float rvx = (float)s_espnow.remote_vpos_x;
+            float rvy = (float)s_espnow.remote_vpos_y;
+            add_trail_blob_virtual(trail, rvx, rvy, 200.0f * dim);
+        } else {
+            s_espnow.has_remote = false;
+        }
+    }
+
+    uint8_t base_hue = s_local_hue;
     for (int y = 0; y < LED_GRID_SIZE; ++y) {
         for (int x = 0; x < LED_GRID_SIZE; ++x) {
             int idx = led_index(x, y);
@@ -372,12 +575,43 @@ static void render_demo(app_ctx_t *ctx, int64_t t_us)
 static void imu_led_task(void *pv)
 {
     app_ctx_t *ctx = (app_ctx_t *)pv;
+    int64_t last_send_us = 0;
     while (true) {
         int16_t ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
         int64_t now = esp_timer_get_time();
 
+        if (s_espnow.pairing_active) {
+            int64_t elapsed_ms = (now - s_espnow.pairing_start_us) / 1000;
+            if (elapsed_ms > ESPNOW_PAIR_WINDOW_MS) {
+                s_espnow.pairing_active = false;
+                ESP_LOGW(TAG, "Pairing window closed; local-only.");
+            } else if ((now - s_espnow.last_hello_us) > (ESPNOW_HELLO_INTERVAL_MS * 1000)) {
+                imu_led_packet_t hello = {
+                    .version = 1,
+                    .msg_type = ESPNOW_MSG_HELLO,
+                    .vpos_x = 0,
+                    .vpos_y = 0,
+                    .hue = 0,
+                };
+                esp_now_send(s_broadcast_mac, (uint8_t *)&hello, sizeof(hello));
+                s_espnow.last_hello_us = now;
+            }
+        }
+
         if (ctx->imu_ok && qmi8658_read_raw(ctx->imu_addr, &ax, &ay, &az, &gx, &gy, &gz) == ESP_OK) {
             render_frame(ctx, ax, ay, az, gx, gy, gz, now);
+
+            if (s_espnow.has_peer && (now - last_send_us) > (ESPNOW_SEND_INTERVAL_MS * 1000)) {
+                imu_led_packet_t pkt = {
+                    .version = 1,
+                    .msg_type = ESPNOW_MSG_DATA,
+                    .vpos_x = s_local_vpos_x,
+                    .vpos_y = s_local_vpos_y,
+                    .hue = s_local_hue,
+                };
+                esp_now_send(s_espnow.peer_mac, (uint8_t *)&pkt, sizeof(pkt));
+                last_send_us = now;
+            }
         } else {
             render_demo(ctx, now);
         }
@@ -388,6 +622,13 @@ static void imu_led_task(void *pv)
 
 void app_main(void)
 {
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_err);
+
     gpio_config_t gpio_cfg = {
         .pin_bit_mask = 1ULL << LED_STRIP_GPIO,
         .mode = GPIO_MODE_OUTPUT,
@@ -418,6 +659,8 @@ void app_main(void)
         imu_ok = (qmi8658_init(imu_addr, &whoami) == ESP_OK);
     }
     ESP_LOGI(TAG, "IMU %s at 0x%02X (WHOAMI=0x%02X)", imu_ok ? "found" : "not found", imu_addr, whoami);
+
+    ESP_ERROR_CHECK(espnow_init());
 
     ws2812_init();
     ws2812_clear(&s_strip);
