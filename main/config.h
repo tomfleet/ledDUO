@@ -32,10 +32,10 @@
 /* Motion + flow tuning */
 #define TILT_INVERT_ROLL     1   /* Flip left/right if tilt feels reversed. */
 #define TILT_INVERT_PITCH    1   /* Flip up/down if tilt feels reversed. */
-#define TILT_GAIN_ROLL       0.5f /* Lower = less sensitive left/right. */
-#define TILT_GAIN_PITCH      0.75f /* Lower = less sensitive up/down. */
-#define FLOW_INPUT_SMOOTH    0.8f /* Higher = slower response to tilt changes. */
-#define FLOW_RESISTANCE      0.25f /* Higher = more drag, shorter glide. */
+#define TILT_GAIN_ROLL       0.65f /* Lower = less sensitive left/right. */
+#define TILT_GAIN_PITCH      0.85f /* Lower = less sensitive up/down. */
+#define FLOW_INPUT_SMOOTH    0.7f /* Higher = slower response to tilt changes. */
+#define FLOW_RESISTANCE      0.5f /* Higher = more drag, shorter glide. */
 #define VIRTUAL_GRID_SCALE   4.0f /* Higher = smoother sub-pixel motion. */
 #define VIRTUAL_BLOB_SCALE   1.6f /* Blob size in virtual-grid units. */
 
@@ -51,6 +51,8 @@
 /* Debug */
 #define DEBUG_MOTION_LOGS    1   /* 1 = print IMU/motion state at 2 Hz. */
 #define DEBUG_MOTION_PERIOD_MS 500
+#define DEBUG_WS_ENABLE      1   /* 1 = enable WebSocket status stream. */
+#define DEBUG_WS_PERIOD_MS   100 /* 10 Hz updates. */
 
 /* ESP-NOW */
 #define ESPNOW_CHANNEL       1   /* Must match on both boards. */
@@ -65,3 +67,16 @@
 #define ESPNOW_RSSI_TRACK_MS 5000
 #define ESPNOW_MSG_HELLO     1
 #define ESPNOW_MSG_DATA      2
+
+/* Captive portal (AP + status page) */
+#define CAPTIVE_PORTAL_ENABLE 1
+#define CAPTIVE_AP_SSID      "leDUO-debug"
+#define CAPTIVE_AP_PASS      ""
+#define CAPTIVE_AP_OPEN      1   /* 1 = open AP, 0 = WPA2 with CAPTIVE_AP_PASS. */
+#define CAPTIVE_AP_MAX_CONN  2
+#define CAPTIVE_AP_CHANNEL   ESPNOW_CHANNEL
+
+/* mDNS (enable only if mdns component is available) */
+#define MDNS_ENABLE          0
+#define MDNS_HOSTNAME        "leduo"
+#define MDNS_INSTANCE        "leDUO"

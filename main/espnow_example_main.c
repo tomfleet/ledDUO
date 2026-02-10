@@ -1,5 +1,6 @@
 /* IMU + WS2812 8x8 demo (ESP32-S3 + QMI8658 + WS2812) */
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -13,6 +14,10 @@
 #include "esp_wifi.h"
 #include "esp_now.h"
 #include "esp_random.h"
+#include "esp_http_server.h"
+#if MDNS_ENABLE
+#include "mdns.h"
+#endif
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "config.h"
@@ -31,6 +36,14 @@ typedef struct {
 static ws2812_strip_t s_strip;
 static rmt_channel_handle_t s_rmt_chan;
 static rmt_encoder_handle_t s_rmt_encoder;
+static esp_netif_t *s_ap_netif;
+static httpd_handle_t s_httpd;
+static bool s_idle_mode;
+static int64_t s_last_motion_us;
+static float s_motion_level;
+static int64_t s_last_send_us;
+static float s_roll_deg;
+static float s_pitch_deg;
 
 typedef struct __attribute__((packed)) {
     uint8_t version;
@@ -118,6 +131,291 @@ static void update_rssi_tracking(int8_t rssi, int64_t now)
     if (rssi > s_espnow.rssi_max_obs) {
         s_espnow.rssi_max_obs = rssi;
     }
+}
+
+static void format_mac(const uint8_t *mac, char *buf, size_t len)
+{
+    snprintf(buf, len, "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+static int build_status_json(char *buf, size_t len)
+{
+    uint8_t mac[6] = {0};
+    char mac_str[18] = "";
+    char peer_str[18] = "";
+    int64_t now = esp_timer_get_time();
+    int64_t since_motion_ms = s_last_motion_us > 0 ? ((now - s_last_motion_us) / 1000) : -1;
+    int64_t pair_left_ms = s_espnow.pairing_active
+        ? (ESPNOW_PAIR_WINDOW_MS - ((now - s_espnow.pairing_start_us) / 1000))
+        : 0;
+    if (pair_left_ms < 0) {
+        pair_left_ms = 0;
+    }
+    int64_t rssi_left_ms = s_espnow.rssi_track_end_us > 0
+        ? ((s_espnow.rssi_track_end_us - now) / 1000)
+        : 0;
+    if (rssi_left_ms < 0) {
+        rssi_left_ms = 0;
+    }
+
+    esp_wifi_get_mac(WIFI_IF_STA, mac);
+    format_mac(mac, mac_str, sizeof(mac_str));
+    if (s_espnow.has_peer) {
+        format_mac(s_espnow.peer_mac, peer_str, sizeof(peer_str));
+    }
+
+    return snprintf(buf, len,
+                    "{\"mac\":\"%s\",\"peer\":\"%s\",\"has_peer\":%s,"
+                    "\"idle\":%s,\"motion\":%.3f,\"since_motion_ms\":%lld,"
+                    "\"rssi\":%d,\"rssi_min\":%d,\"rssi_max\":%d,\"rssi_track_ms\":%lld,"
+                    "\"pairing\":%s,\"pairing_ms\":%lld,"
+                    "\"local_vpos\":[%u,%u],\"local_hue\":%u,"
+                    "\"remote_vpos\":[%u,%u],\"remote_hue\":%u,"
+                    "\"roll\":%.2f,\"pitch\":%.2f}",
+                    mac_str,
+                    s_espnow.has_peer ? peer_str : "",
+                    s_espnow.has_peer ? "true" : "false",
+                    s_idle_mode ? "true" : "false",
+                    s_motion_level,
+                    since_motion_ms,
+                    (int)s_espnow.remote_rssi,
+                    (int)s_espnow.rssi_min_obs,
+                    (int)s_espnow.rssi_max_obs,
+                    rssi_left_ms,
+                    s_espnow.pairing_active ? "true" : "false",
+                    pair_left_ms,
+                    s_local_vpos_x,
+                    s_local_vpos_y,
+                    s_local_hue,
+                    s_espnow.remote_vpos_x,
+                    s_espnow.remote_vpos_y,
+                    s_espnow.remote_hue,
+                    s_roll_deg,
+                    s_pitch_deg);
+}
+
+static esp_err_t clear_peer_in_nvs(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("pairing", NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_erase_key(handle, "peer_mac");
+    if (err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
+
+static void start_pairing_window(void)
+{
+    s_espnow.has_peer = false;
+    s_espnow.pairing_active = true;
+    s_espnow.pairing_start_us = esp_timer_get_time();
+    s_espnow.last_hello_us = 0;
+}
+
+static esp_err_t http_root_get(httpd_req_t *req)
+{
+    static char body[10000];
+    snprintf(body, sizeof(body),
+             "<!doctype html><html><head>"
+             "<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+             "<title>leDUO debug</title></head><body>"
+             "<style>"
+             "body{margin:0;font-family:'Palatino Linotype','Book Antiqua',Palatino,serif;"
+             "background:radial-gradient(circle at 10%% 10%%,#1c2b3a 0%%,#0b0f14 60%%);"
+             "color:#e9f1ff;}"
+             ".wrap{padding:18px;}"
+             ".grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;}"
+             ".portrait .grid{grid-template-columns:1fr;}"
+             ".card{background:rgba(15,25,35,0.75);border:1px solid rgba(120,160,200,0.25);"
+             "border-radius:12px;padding:14px;box-shadow:0 10px 30px rgba(0,0,0,0.35);}"
+             "h2{margin:6px 0 12px 0;font-weight:600;letter-spacing:0.5px;}"
+             ".kv{display:grid;grid-template-columns:130px 1fr;gap:6px;font-size:14px;}"
+             "canvas{width:100%%;height:180px;background:#0a1118;border-radius:10px;}"
+             ".graph-stack{position:relative;width:100%%;height:180px;}"
+             ".graph-stack canvas{position:absolute;left:0;top:0;width:100%%;height:100%%;}"
+             ".graph-layer{background:transparent;}"
+             "a{color:#9fd6ff;text-decoration:none;}"
+             "</style></head><body>"
+             "<div class='wrap'>"
+             "<h2>leDUO debug</h2>"
+             "<div class='grid'>"
+             "<div class='card'>"
+             "<div class='kv'>"
+             "<div>MAC</div><div id='mac'>-</div>"
+             "<div>Peer</div><div id='peer'>-</div>"
+             "<div>Idle</div><div id='idle'>-</div>"
+             "<div>Orientation</div><div id='orientation'>-</div>"
+             "<div>Motion</div><div id='motion'>-</div>"
+             "<div>Since</div><div id='since'>-</div>"
+             "<div>RSSI</div><div id='rssi'>-</div>"
+             "<div>Pairing</div><div id='pairing'>-</div>"
+             "<div>Local</div><div id='local'>-</div>"
+             "<div>Remote</div><div id='remote'>-</div>"
+             "</div>"
+             "<p><a href='/status'>/status</a> | <a href='/pair/clear'>clear pairing</a></p>"
+             "</div>"
+             "<div class='card'>"
+             "<div>Roll/Pitch</div><canvas id='tilt'></canvas>"
+             "<div style='margin-top:10px'>LED Preview</div><canvas id='led'></canvas>"
+             "<div style='margin-top:10px'>Rolling Graph</div>"
+             "<div class='graph-stack'>"
+             "<canvas id='graph-base'></canvas>"
+             "<canvas id='graph-roll' class='graph-layer'></canvas>"
+             "<canvas id='graph-pitch' class='graph-layer'></canvas>"
+             "</div>"
+             "</div>"
+             "</div>"
+             "</div>"
+             "<script>"
+             "const tilt=document.getElementById('tilt');"
+             "const graphBase=document.getElementById('graph-base');"
+             "const graphRoll=document.getElementById('graph-roll');"
+             "const graphPitch=document.getElementById('graph-pitch');"
+             "const led=document.getElementById('led');"
+             "const rollBuf=[],pitchBuf=[];const maxN=120;"
+             "function setText(id,v){document.getElementById(id).textContent=v;}"
+             "function updateOrientation(){const o=window.innerWidth>window.innerHeight?'landscape':'portrait';"
+             "document.body.classList.remove('landscape','portrait');document.body.classList.add(o);"
+             "setText('orientation',o);}"
+             "function drawTilt(r,p){const ctx=tilt.getContext('2d');"
+             "const w=tilt.width=tilt.clientWidth,h=tilt.height=tilt.clientHeight;"
+             "ctx.clearRect(0,0,w,h);"
+             "ctx.strokeStyle='#2d516b';ctx.lineWidth=2;"
+             "ctx.beginPath();ctx.arc(w/2,h/2,Math.min(w,h)*0.35,0,Math.PI*2);ctx.stroke();"
+             "const rx=Math.max(-45,Math.min(45,r));"
+             "const py=Math.max(-45,Math.min(45,p));"
+             "const dx=rx/45* Math.min(w,h)*0.32;"
+             "const dy=py/45* Math.min(w,h)*0.32;"
+             "ctx.fillStyle='#9fd6ff';ctx.beginPath();ctx.arc(w/2+dx,h/2+dy,8,0,Math.PI*2);ctx.fill();"
+             "}"
+             "function drawGraph(){const ctxBase=graphBase.getContext('2d');"
+             "const w=graphBase.width=graphBase.clientWidth,h=graphBase.height=graphBase.clientHeight;"
+             "ctxBase.clearRect(0,0,w,h);"
+             "ctxBase.strokeStyle='#1e2a38';ctxBase.lineWidth=1;"
+             "for(let i=1;i<4;i++){ctxBase.beginPath();ctxBase.moveTo(0,h*i/4);ctxBase.lineTo(w,h*i/4);ctxBase.stroke();}"
+             "const ctxRoll=graphRoll.getContext('2d');const ctxPitch=graphPitch.getContext('2d');"
+             "graphRoll.width=w;graphRoll.height=h;graphPitch.width=w;graphPitch.height=h;"
+             "ctxRoll.clearRect(0,0,w,h);ctxPitch.clearRect(0,0,w,h);"
+             "let maxRoll=5;for(const v of rollBuf){maxRoll=Math.max(maxRoll,Math.abs(v));}"
+             "let maxPitch=5;for(const v of pitchBuf){maxPitch=Math.max(maxPitch,Math.abs(v));}"
+             "maxRoll=Math.min(maxRoll,90);maxPitch=Math.min(maxPitch,90);"
+             "function plot(ctx,arr,color,scale){ctx.strokeStyle=color;ctx.lineWidth=2;ctx.beginPath();"
+             "for(let i=0;i<arr.length;i++){const x=i/(maxN-1)*w;"
+             "const y=h/2 - (arr[i]/scale)*(h*0.4);"
+             "if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);}ctx.stroke();}"
+             "plot(ctxRoll,rollBuf,'#ff9c6b',maxRoll);plot(ctxPitch,pitchBuf,'#7fd1ff',maxPitch);"
+             "ctxRoll.font='12px serif';ctxRoll.fillStyle='#ffb493';ctxRoll.fillText('±'+maxRoll.toFixed(0)+'°',8,16);"
+             "const rightLabel='±'+maxPitch.toFixed(0)+'°';"
+             "ctxPitch.font='12px serif';ctxPitch.fillStyle='#8fd8ff';"
+             "ctxPitch.fillText(rightLabel,w-ctxPitch.measureText(rightLabel).width-8,16);"
+             "}"
+             "function hsv(h,s,v){const c=v*s;const x=c*(1-Math.abs(((h/60)%%2)-1));"
+             "const m=v-c;let r=0,g=0,b=0;"
+             "if(h<60){r=c;g=x;}else if(h<120){r=x;g=c;}else if(h<180){g=c;b=x;}"
+             "else if(h<240){g=x;b=c;}else if(h<300){r=x;b=c;}else{r=c;b=x;}"
+             "return [Math.round((r+m)*255),Math.round((g+m)*255),Math.round((b+m)*255)];}"
+             "function drawLed(d){const ctx=led.getContext('2d');"
+             "const w=led.width=led.clientWidth,h=led.height=led.clientHeight;ctx.clearRect(0,0,w,h);"
+             "const size=Math.min(w,h);const pad=8;const cell=(size-2*pad)/8;"
+             "ctx.fillStyle='#0b141d';ctx.fillRect(0,0,w,h);"
+             "for(let y=0;y<8;y++){for(let x=0;x<8;x++){"
+             "ctx.strokeStyle='rgba(80,110,140,0.25)';ctx.strokeRect(pad+x*cell,pad+y*cell,cell,cell);}}"
+             "function blob(vx,vy,hue,alpha){const fx=vx/4;const fy=vy/4;"
+             "const cx=pad+(fx+0.5)*cell;const cy=pad+(fy+0.5)*cell;"
+             "const [r,g,b]=hsv((hue||0)/255*360,1,1);"
+             "ctx.fillStyle='rgba('+r+','+g+','+b+','+alpha+')';"
+             "ctx.beginPath();ctx.arc(cx,cy,cell*0.7,0,Math.PI*2);ctx.fill();"
+             "ctx.globalAlpha=alpha*0.5;ctx.beginPath();ctx.arc(cx,cy,cell*1.4,0,Math.PI*2);ctx.fill();"
+             "ctx.globalAlpha=1;}"
+             "if(d.local_vpos)blob(d.local_vpos[0],d.local_vpos[1],d.local_hue,0.9);"
+             "if(d.remote_vpos)blob(d.remote_vpos[0],d.remote_vpos[1],d.remote_hue,0.5);"
+             "}"
+             "function ingest(d){"
+             "setText('mac',d.mac||'-');setText('peer',d.peer||'-');"
+             "setText('idle',d.idle?'yes':'no');"
+             "updateOrientation();"
+             "setText('motion',d.motion?.toFixed(3));"
+             "setText('since',d.since_motion_ms+' ms');"
+             "setText('rssi',d.rssi+' dBm ('+d.rssi_min+'/'+d.rssi_max+')');"
+             "setText('pairing',d.pairing?'open':'closed');"
+             "setText('local',d.local_vpos+' hue '+d.local_hue);"
+             "setText('remote',d.remote_vpos+' hue '+d.remote_hue);"
+             "rollBuf.push(d.roll||0);pitchBuf.push(d.pitch||0);"
+             "while(rollBuf.length>maxN){rollBuf.shift();pitchBuf.shift();}"
+             "drawTilt(d.roll||0,d.pitch||0);drawLed(d);drawGraph();"
+             "}"
+             "function poll(){fetch('/status').then(r=>r.json()).then(ingest).catch(()=>{});}"
+             "setInterval(poll,100);poll();"
+             "</script></body></html>");
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t http_status_get(httpd_req_t *req)
+{
+    char body[512];
+    build_status_json(body, sizeof(body));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t http_pair_clear(httpd_req_t *req)
+{
+    clear_peer_in_nvs();
+    start_pairing_window();
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, "pairing cleared\n", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t http_404_handler(httpd_req_t *req, httpd_err_code_t err)
+{
+    (void)err;
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
+static void start_captive_portal(void)
+{
+#if CAPTIVE_PORTAL_ENABLE
+    if (!s_ap_netif) {
+        return;
+    }
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.uri_match_fn = httpd_uri_match_wildcard;
+    if (httpd_start(&s_httpd, &config) == ESP_OK) {
+        httpd_uri_t root = {
+            .uri = "/",
+            .method = HTTP_GET,
+            .handler = http_root_get,
+        };
+        httpd_uri_t status = {
+            .uri = "/status",
+            .method = HTTP_GET,
+            .handler = http_status_get,
+        };
+        httpd_uri_t clear = {
+            .uri = "/pair/clear",
+            .method = HTTP_GET,
+            .handler = http_pair_clear,
+        };
+        httpd_register_uri_handler(s_httpd, &root);
+        httpd_register_uri_handler(s_httpd, &status);
+        httpd_register_uri_handler(s_httpd, &clear);
+        httpd_register_err_handler(s_httpd, HTTPD_404_NOT_FOUND, http_404_handler);
+    }
+#endif
 }
 
 static void add_trail_bilinear(uint8_t *trail, float x, float y, float intensity)
@@ -358,12 +656,36 @@ static esp_err_t espnow_init(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+    s_ap_netif = esp_netif_create_default_wifi_ap();
+    esp_netif_create_default_wifi_sta();
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+
+    wifi_config_t ap_cfg = {0};
+    snprintf((char *)ap_cfg.ap.ssid, sizeof(ap_cfg.ap.ssid), "%s", CAPTIVE_AP_SSID);
+    ap_cfg.ap.ssid_len = strlen(CAPTIVE_AP_SSID);
+    ap_cfg.ap.channel = CAPTIVE_AP_CHANNEL;
+    ap_cfg.ap.max_connection = CAPTIVE_AP_MAX_CONN;
+    if (CAPTIVE_AP_OPEN) {
+        ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
+    } else {
+        snprintf((char *)ap_cfg.ap.password, sizeof(ap_cfg.ap.password), "%s", CAPTIVE_AP_PASS);
+        ap_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    }
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
+#if MDNS_ENABLE
+    ESP_ERROR_CHECK(mdns_init());
+    ESP_ERROR_CHECK(mdns_hostname_set(MDNS_HOSTNAME));
+    ESP_ERROR_CHECK(mdns_instance_name_set(MDNS_INSTANCE));
+    ESP_ERROR_CHECK(mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0));
+#endif
 
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
@@ -472,6 +794,8 @@ static void render_frame(app_ctx_t *ctx, int16_t ax, int16_t ay, int16_t az,
 
     float roll = atan2f(fay, faz);
     float pitch = atan2f(-fax, sqrtf((fay * fay) + (faz * faz)));
+    s_roll_deg = roll * 57.2958f;
+    s_pitch_deg = pitch * 57.2958f;
 
     float roll_norm = roll / (float)(M_PI / 2.0f);
     float pitch_norm = pitch / (float)(M_PI / 2.0f);
@@ -627,16 +951,20 @@ static void imu_led_task(void *pv)
 
         if (ctx->imu_ok && qmi8658_read_raw(ctx->imu_addr, &ax, &ay, &az, &gx, &gy, &gz) == ESP_OK) {
             float motion = (fabsf((float)gx) + fabsf((float)gy) + fabsf((float)gz)) / MOTION_GYRO_SCALE;
+            s_motion_level = motion;
             if (motion > MOTION_EXIT_IDLE) {
                 idle_mode = false;
                 last_motion_us = now;
+                s_last_motion_us = now;
             }
             if (!idle_mode && motion > MOTION_ENTER_IDLE) {
                 last_motion_us = now;
+                s_last_motion_us = now;
             }
             if (!idle_mode && last_motion_us > 0 && ((now - last_motion_us) > (IDLE_TIMEOUT_MS * 1000))) {
                 idle_mode = true;
             }
+            s_idle_mode = idle_mode;
             if (DEBUG_MOTION_LOGS && (now - last_debug_us) > (DEBUG_MOTION_PERIOD_MS * 1000)) {
                 int64_t since_motion_ms = (last_motion_us > 0) ? ((now - last_motion_us) / 1000) : -1;
                 int8_t rssi_min = s_espnow.rssi_has_obs ? s_espnow.rssi_min_obs : ESPNOW_RSSI_MIN_DBM;
@@ -663,6 +991,7 @@ static void imu_led_task(void *pv)
                 };
                 esp_now_send(s_espnow.peer_mac, (uint8_t *)&pkt, sizeof(pkt));
                 last_send_us = now;
+                s_last_send_us = now;
             }
         } else {
             render_demo(ctx, now);
@@ -713,6 +1042,7 @@ void app_main(void)
     ESP_LOGI(TAG, "IMU %s at 0x%02X (WHOAMI=0x%02X)", imu_ok ? "found" : "not found", imu_addr, whoami);
 
     ESP_ERROR_CHECK(espnow_init());
+    start_captive_portal();
 
     ws2812_init();
     ws2812_clear(&s_strip);
