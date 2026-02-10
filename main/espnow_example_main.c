@@ -12,50 +12,10 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_now.h"
+#include "esp_random.h"
 #include "nvs_flash.h"
 #include "nvs.h"
-
-#define I2C_PORT             I2C_NUM_0
-#define I2C_SDA_GPIO         11
-#define I2C_SCL_GPIO         12
-#define I2C_FREQ_HZ          400000
-
-#define IMU_ADDR_PRIMARY     0x6B
-#define IMU_ADDR_SECONDARY   0x6A
-
-#define QMI8658_REG_WHOAMI   0x00
-#define QMI8658_REG_CTRL1    0x02
-#define QMI8658_REG_CTRL2    0x03
-#define QMI8658_REG_CTRL3    0x04
-#define QMI8658_REG_CTRL7    0x08
-#define QMI8658_REG_AX_L     0x35
-
-#define LED_STRIP_GPIO       14
-#define LED_STRIP_LEN        64
-#define LED_GRID_SIZE        8
-#define LED_SERPENTINE       0
-#define TILT_INVERT_ROLL     1   /* Flip left/right if tilt feels reversed. */
-#define TILT_INVERT_PITCH    1   /* Flip up/down if tilt feels reversed. */
-#define TILT_GAIN_ROLL       0.5f /* Lower = less sensitive left/right. */
-#define TILT_GAIN_PITCH      0.75f /* Lower = less sensitive up/down. */
-#define FLOW_INPUT_SMOOTH    0.8f /* Higher = slower response to tilt changes. */
-#define FLOW_RESISTANCE      0.25f /* Higher = more drag, shorter glide. */
-#define VIRTUAL_GRID_SCALE   4.0f /* Higher = smoother sub-pixel motion. */
-#define VIRTUAL_BLOB_SCALE   1.6f /* Blob size in virtual-grid units. */
-#define LED_BRIGHTNESS_SCALE 8   /* Lower = dimmer LEDs. */
-#define ESPNOW_CHANNEL       1   /* Must match on both boards. */
-#define ESPNOW_SEND_INTERVAL_MS 40
-#define ESPNOW_PAIR_WINDOW_MS 6000
-#define ESPNOW_HELLO_INTERVAL_MS 300
-#define ESPNOW_REMOTE_TIMEOUT_MS 800
-#define ESPNOW_REMOTE_DIM    130 /* 0-255, lower = dimmer remote trail. */
-#define ESPNOW_MSG_HELLO     1
-#define ESPNOW_MSG_DATA      2
-#define WS2812_RESOLUTION_HZ 10000000
-#define WS2812_T0H_TICKS     4
-#define WS2812_T0L_TICKS     8
-#define WS2812_T1H_TICKS     7
-#define WS2812_T1L_TICKS     6
+#include "config.h"
 
 static const char *TAG = "imu_led";
 
@@ -91,6 +51,11 @@ typedef struct {
     uint8_t remote_vpos_x;
     uint8_t remote_vpos_y;
     uint8_t remote_hue;
+    int8_t remote_rssi;
+    int8_t rssi_min_obs;
+    int8_t rssi_max_obs;
+    bool rssi_has_obs;
+    int64_t rssi_track_end_us;
     int64_t remote_rx_time_us;
 } espnow_state_t;
 
@@ -123,6 +88,36 @@ static uint8_t add_u8_sat(uint8_t a, uint8_t b)
 {
     uint16_t sum = (uint16_t)a + (uint16_t)b;
     return (sum > 255) ? 255 : (uint8_t)sum;
+}
+
+static float clamp_f(float v, float lo, float hi)
+{
+    if (v < lo) {
+        return lo;
+    }
+    if (v > hi) {
+        return hi;
+    }
+    return v;
+}
+
+static void update_rssi_tracking(int8_t rssi, int64_t now)
+{
+    if (s_espnow.rssi_track_end_us > 0 && now > s_espnow.rssi_track_end_us) {
+        return;
+    }
+    if (!s_espnow.rssi_has_obs) {
+        s_espnow.rssi_min_obs = rssi;
+        s_espnow.rssi_max_obs = rssi;
+        s_espnow.rssi_has_obs = true;
+        return;
+    }
+    if (rssi < s_espnow.rssi_min_obs) {
+        s_espnow.rssi_min_obs = rssi;
+    }
+    if (rssi > s_espnow.rssi_max_obs) {
+        s_espnow.rssi_max_obs = rssi;
+    }
 }
 
 static void add_trail_bilinear(uint8_t *trail, float x, float y, float intensity)
@@ -296,6 +291,8 @@ static bool pair_with_sender(const uint8_t *mac)
     }
     s_espnow.has_peer = true;
     s_espnow.pairing_active = false;
+    s_espnow.rssi_has_obs = false;
+    s_espnow.rssi_track_end_us = esp_timer_get_time() + (ESPNOW_RSSI_TRACK_MS * 1000);
     save_peer_mac_to_nvs(s_espnow.peer_mac);
     ESP_LOGI(TAG, "Paired with %02X:%02X:%02X:%02X:%02X:%02X",
              s_espnow.peer_mac[0], s_espnow.peer_mac[1], s_espnow.peer_mac[2],
@@ -333,6 +330,10 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
         s_espnow.remote_vpos_x = pkt->vpos_x;
         s_espnow.remote_vpos_y = pkt->vpos_y;
         s_espnow.remote_hue = pkt->hue;
+        if (recv_info->rx_ctrl) {
+            s_espnow.remote_rssi = recv_info->rx_ctrl->rssi;
+            update_rssi_tracking(s_espnow.remote_rssi, esp_timer_get_time());
+        }
         s_espnow.remote_rx_time_us = esp_timer_get_time();
         s_espnow.has_remote = true;
     }
@@ -375,6 +376,8 @@ static esp_err_t espnow_init(void)
         memcpy(peer.peer_addr, s_espnow.peer_mac, ESP_NOW_ETH_ALEN);
         ESP_ERROR_CHECK(esp_now_add_peer(&peer));
         s_espnow.has_peer = true;
+        s_espnow.rssi_has_obs = false;
+        s_espnow.rssi_track_end_us = esp_timer_get_time() + (ESPNOW_RSSI_TRACK_MS * 1000);
         ESP_LOGI(TAG, "ESP-NOW peer loaded: %02X:%02X:%02X:%02X:%02X:%02X",
                  s_espnow.peer_mac[0], s_espnow.peer_mac[1], s_espnow.peer_mac[2],
                  s_espnow.peer_mac[3], s_espnow.peer_mac[4], s_espnow.peer_mac[5]);
@@ -453,13 +456,15 @@ static esp_err_t qmi8658_read_raw(uint8_t addr, int16_t *ax, int16_t *ay, int16_
 }
 
 static void render_frame(app_ctx_t *ctx, int16_t ax, int16_t ay, int16_t az,
-                         int16_t gx, int16_t gy, int16_t gz, int64_t t_us)
+                         int16_t gx, int16_t gy, int16_t gz, int64_t t_us,
+                         bool idle_mode)
 {
     static float pos_x = 3.5f;
     static float pos_y = 3.5f;
     static float vel_x = 0.0f;
     static float vel_y = 0.0f;
     static uint8_t trail[LED_STRIP_LEN] = {0};
+    static bool idle_active = false;
 
     float fax = (float)ax;
     float fay = (float)ay;
@@ -489,16 +494,26 @@ static void render_frame(app_ctx_t *ctx, int16_t ax, int16_t ay, int16_t az,
     if (pitch_norm > 1.0f) pitch_norm = 1.0f;
     if (pitch_norm < -1.0f) pitch_norm = -1.0f;
 
-    float mag = sqrtf((roll_norm * roll_norm) + (pitch_norm * pitch_norm));
-    if (mag > 1.0f) {
-        mag = 1.0f;
-    }
+    if (idle_mode) {
+        if (!idle_active) {
+            float angle = (float)(esp_random() & 0xFFFF) / 65535.0f * (float)(M_PI * 2.0f);
+            vel_x = cosf(angle) * IDLE_SPEED;
+            vel_y = sinf(angle) * IDLE_SPEED;
+            idle_active = true;
+        }
+    } else {
+        idle_active = false;
+        float mag = sqrtf((roll_norm * roll_norm) + (pitch_norm * pitch_norm));
+        if (mag > 1.0f) {
+            mag = 1.0f;
+        }
 
-    float speed = 0.06f + (0.45f * mag);
-    vel_x = (vel_x * FLOW_INPUT_SMOOTH) + (roll_norm * speed);
-    vel_y = (vel_y * FLOW_INPUT_SMOOTH) + (pitch_norm * speed);
-    vel_x *= (1.0f - FLOW_RESISTANCE);
-    vel_y *= (1.0f - FLOW_RESISTANCE);
+        float speed = 0.06f + (0.45f * mag);
+        vel_x = (vel_x * FLOW_INPUT_SMOOTH) + (roll_norm * speed);
+        vel_y = (vel_y * FLOW_INPUT_SMOOTH) + (pitch_norm * speed);
+        vel_x *= (1.0f - FLOW_RESISTANCE);
+        vel_y *= (1.0f - FLOW_RESISTANCE);
+    }
 
     pos_x += vel_x;
     pos_y += vel_y;
@@ -521,17 +536,26 @@ static void render_frame(app_ctx_t *ctx, int16_t ax, int16_t ay, int16_t az,
     s_local_vpos_y = (uint8_t)clamp_int((int)lrintf(vpos_y), 0,
                                         (int)lrintf((LED_GRID_SIZE - 1) * VIRTUAL_GRID_SCALE));
     s_local_hue = (uint8_t)((t_us / 12000) & 0xFF);
-    add_trail_blob_virtual(trail, vpos_x, vpos_y, 220.0f);
-    add_trail_blob_virtual(trail, vtail_x, vtail_y, 120.0f);
+    float local_dim = idle_mode ? (IDLE_LOCAL_DIM / 255.0f) : 1.0f;
+    add_trail_blob_virtual(trail, vpos_x, vpos_y, 220.0f * local_dim);
+    add_trail_blob_virtual(trail, vtail_x, vtail_y, 120.0f * local_dim);
 
     if (s_espnow.has_remote) {
         int64_t age_ms = (t_us - s_espnow.remote_rx_time_us) / 1000;
         if (age_ms < ESPNOW_REMOTE_TIMEOUT_MS) {
             float fade = 1.0f - ((float)age_ms / (float)ESPNOW_REMOTE_TIMEOUT_MS);
-            float dim = (ESPNOW_REMOTE_DIM / 255.0f) * fade;
+            float base_dim = idle_mode ? IDLE_REMOTE_DIM : ESPNOW_REMOTE_DIM;
+            int8_t rssi_min = s_espnow.rssi_has_obs ? s_espnow.rssi_min_obs : ESPNOW_RSSI_MIN_DBM;
+            int8_t rssi_max = s_espnow.rssi_has_obs ? s_espnow.rssi_max_obs : ESPNOW_RSSI_MAX_DBM;
+            float denom = (float)(rssi_max - rssi_min);
+            float rssi_norm = denom > 1.0f ? ((s_espnow.remote_rssi - rssi_min) / denom) : 0.0f;
+            rssi_norm = clamp_f(rssi_norm, 0.0f, 1.0f);
+            float link = 0.2f + (0.8f * rssi_norm);
+            float dim = (base_dim / 255.0f) * fade * link;
             float rvx = (float)s_espnow.remote_vpos_x;
             float rvy = (float)s_espnow.remote_vpos_y;
             add_trail_blob_virtual(trail, rvx, rvy, 200.0f * dim);
+            add_trail_blob_virtual(trail, rvx, rvy, ESPNOW_RSSI_GLOW_MAX * fade * rssi_norm);
         } else {
             s_espnow.has_remote = false;
         }
@@ -576,6 +600,9 @@ static void imu_led_task(void *pv)
 {
     app_ctx_t *ctx = (app_ctx_t *)pv;
     int64_t last_send_us = 0;
+    int64_t last_motion_us = 0;
+    int64_t last_debug_us = 0;
+    bool idle_mode = false;
     while (true) {
         int16_t ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
         int64_t now = esp_timer_get_time();
@@ -599,7 +626,32 @@ static void imu_led_task(void *pv)
         }
 
         if (ctx->imu_ok && qmi8658_read_raw(ctx->imu_addr, &ax, &ay, &az, &gx, &gy, &gz) == ESP_OK) {
-            render_frame(ctx, ax, ay, az, gx, gy, gz, now);
+            float motion = (fabsf((float)gx) + fabsf((float)gy) + fabsf((float)gz)) / MOTION_GYRO_SCALE;
+            if (motion > MOTION_EXIT_IDLE) {
+                idle_mode = false;
+                last_motion_us = now;
+            }
+            if (!idle_mode && motion > MOTION_ENTER_IDLE) {
+                last_motion_us = now;
+            }
+            if (!idle_mode && last_motion_us > 0 && ((now - last_motion_us) > (IDLE_TIMEOUT_MS * 1000))) {
+                idle_mode = true;
+            }
+            if (DEBUG_MOTION_LOGS && (now - last_debug_us) > (DEBUG_MOTION_PERIOD_MS * 1000)) {
+                int64_t since_motion_ms = (last_motion_us > 0) ? ((now - last_motion_us) / 1000) : -1;
+                int8_t rssi_min = s_espnow.rssi_has_obs ? s_espnow.rssi_min_obs : ESPNOW_RSSI_MIN_DBM;
+                int8_t rssi_max = s_espnow.rssi_has_obs ? s_espnow.rssi_max_obs : ESPNOW_RSSI_MAX_DBM;
+                float denom = (float)(rssi_max - rssi_min);
+                float rssi_norm = denom > 1.0f ? ((s_espnow.remote_rssi - rssi_min) / denom) : 0.0f;
+                rssi_norm = clamp_f(rssi_norm, 0.0f, 1.0f);
+                float glow = ESPNOW_RSSI_GLOW_MAX * rssi_norm;
+                ESP_LOGI(TAG,
+                         "imu ax=%d ay=%d az=%d gx=%d gy=%d gz=%d motion=%.3f idle=%d since=%lldms rssi=%d norm=%.2f glow=%.1f",
+                         ax, ay, az, gx, gy, gz, motion, idle_mode ? 1 : 0, since_motion_ms,
+                         s_espnow.remote_rssi, rssi_norm, glow);
+                last_debug_us = now;
+            }
+            render_frame(ctx, ax, ay, az, gx, gy, gz, now, idle_mode);
 
             if (s_espnow.has_peer && (now - last_send_us) > (ESPNOW_SEND_INTERVAL_MS * 1000)) {
                 imu_led_packet_t pkt = {
