@@ -9,6 +9,7 @@ The code is targeting the [Waveshare ESP32-S3-Matrix](https://www.waveshare.com/
 * Draws an interactive sprite/tail on the 8 x 8 LED matrix, controlled by the IMU / board tilt & roll.
 * Also, should auto-pair with a 2nd board running the same code.
 * The boards will broadcast and receive each other's LED data, and render both trails
+* There is some basic "collision" event logic that should be broadcast/synced. 
 * There's an auto-ranging RSSI function that averages each other's measured RSSI, scaled to an initial 5s averaging at pairing
 * the RSSI is used to scale the remote/guest brightness of the led sprite on the local screen
 * the sprites will just kinda wander about if they get bored (idle time = DVD screensaver)
