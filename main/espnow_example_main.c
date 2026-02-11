@@ -43,6 +43,16 @@ static float clamp_f(float v, float lo, float hi)
     return v;
 }
 
+static uint32_t seed_from_mac(const uint8_t *mac)
+{
+    uint32_t hash = 2166136261u;
+    for (int i = 0; i < 6; ++i) {
+        hash ^= mac[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
 static void imu_led_task(void *pv)
 {
     app_ctx_t *ctx = (app_ctx_t *)pv;
@@ -155,6 +165,10 @@ void app_main(void)
 
     ws2812_init();
     game_logic_init(&s_game, &s_strip);
+    uint8_t mac[6] = {0};
+    if (esp_wifi_get_mac(WIFI_IF_STA, mac) == ESP_OK) {
+        game_logic_set_seed(&s_game, seed_from_mac(mac));
+    }
     ws2812_clear(&s_strip);
     ws2812_show(&s_strip);
     vTaskDelay(pdMS_TO_TICKS(10));

@@ -106,6 +106,27 @@ static void hsv_to_rgb(uint8_t h, uint8_t s, uint8_t v, uint8_t *r, uint8_t *g, 
     }
 }
 
+static uint32_t xorshift32(uint32_t *state)
+{
+    uint32_t x = *state;
+    if (x == 0) {
+        x = 0x6C8E9CF5u;
+    }
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
+
+static uint16_t game_logic_rand_u16(game_logic_t *game)
+{
+    if (game && game->rng_seeded) {
+        return (uint16_t)(xorshift32(&game->rng_state) & 0xFFFFu);
+    }
+    return (uint16_t)(esp_random() & 0xFFFFu);
+}
+
 void game_logic_init(game_logic_t *game, ws2812_strip_t *strip)
 {
     if (!game) {
@@ -115,6 +136,18 @@ void game_logic_init(game_logic_t *game, ws2812_strip_t *strip)
     game->strip = strip;
     game->pos_x = 3.5f;
     game->pos_y = 3.5f;
+}
+
+void game_logic_set_seed(game_logic_t *game, uint32_t seed)
+{
+    if (!game) {
+        return;
+    }
+    if (seed == 0) {
+        seed = 0x6C8E9CF5u;
+    }
+    game->rng_state = seed;
+    game->rng_seeded = true;
 }
 
 void game_logic_render_frame(game_logic_t *game,
@@ -170,7 +203,7 @@ void game_logic_render_frame(game_logic_t *game,
 
     if (idle_mode) {
         if (!game->idle_active) {
-            float angle = (float)(esp_random() & 0xFFFF) / 65535.0f * (float)(M_PI * 2.0f);
+            float angle = (float)game_logic_rand_u16(game) / 65535.0f * (float)(M_PI * 2.0f);
             game->vel_x = cosf(angle) * IDLE_SPEED;
             game->vel_y = sinf(angle) * IDLE_SPEED;
             game->idle_active = true;

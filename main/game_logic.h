@@ -25,9 +25,12 @@ typedef struct {
     uint8_t local_hue;
     float roll_deg;
     float pitch_deg;
+    uint32_t rng_state;
+    bool rng_seeded;
 } game_logic_t;
 
 void game_logic_init(game_logic_t *game, ws2812_strip_t *strip);
+void game_logic_set_seed(game_logic_t *game, uint32_t seed);
 void game_logic_render_frame(game_logic_t *game,
                              int16_t ax, int16_t ay, int16_t az,
                              int16_t gx, int16_t gy, int16_t gz,
