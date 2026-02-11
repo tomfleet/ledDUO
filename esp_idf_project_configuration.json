@@ -8,8 +8,8 @@
       "sdkconfigFilePath": ""
     },
     "env": {},
+    "idfTarget": "esp32s3",
     "flashBaudRate": "",
-    "idfTarget": "",
     "monitorBaudRate": "",
     "openOCD": {
       "debugLevel": -1,

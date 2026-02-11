@@ -18,6 +18,7 @@
 #if MDNS_ENABLE
 #include "mdns.h"
 #endif
+#include "esp_spiffs.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "config.h"
@@ -218,9 +219,30 @@ static void start_pairing_window(void)
     s_espnow.last_hello_us = 0;
 }
 
+static void init_spiffs(void)
+{
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/spiffs",
+        .partition_label = NULL,
+        .max_files = 4,
+        .format_if_mount_failed = false,
+    };
+    esp_err_t err = esp_vfs_spiffs_register(&conf);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SPIFFS mount failed: 0x%x", err);
+        return;
+    }
+    size_t total = 0;
+    size_t used = 0;
+    err = esp_spiffs_info(NULL, &total, &used);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "SPIFFS: total=%u used=%u", (unsigned)total, (unsigned)used);
+    }
+}
+
 static esp_err_t http_root_get(httpd_req_t *req)
 {
-    static char body[10000];
+    static char body[20000];
     snprintf(body, sizeof(body),
              "<!doctype html><html><head>"
              "<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -237,6 +259,11 @@ static esp_err_t http_root_get(httpd_req_t *req)
              "h2{margin:6px 0 12px 0;font-weight:600;letter-spacing:0.5px;}"
              ".kv{display:grid;grid-template-columns:130px 1fr;gap:6px;font-size:14px;}"
              "canvas{width:100%%;height:180px;background:#0a1118;border-radius:10px;}"
+             ".led-stack{position:relative;width:100%%;aspect-ratio:520/536;}"
+             ".led-stack canvas{position:absolute;left:0;top:0;width:100%%;height:100%%;}"
+             ".led-overlay{pointer-events:none;}"
+             "#overlay{background:transparent;}"
+             "#led{background:#ffffff;}"
              ".graph-stack{position:relative;width:100%%;height:180px;}"
              ".graph-stack canvas{position:absolute;left:0;top:0;width:100%%;height:100%%;}"
              ".graph-layer{background:transparent;}"
@@ -262,7 +289,11 @@ static esp_err_t http_root_get(httpd_req_t *req)
              "</div>"
              "<div class='card'>"
              "<div>Roll/Pitch</div><canvas id='tilt'></canvas>"
-             "<div style='margin-top:10px'>LED Preview</div><canvas id='led'></canvas>"
+             "<div style='margin-top:10px'>LED Preview</div>"
+             "<div class='led-stack'>"
+             "<canvas id='led'></canvas>"
+             "<canvas id='overlay' class='led-overlay'></canvas>"
+             "</div>"
              "<div style='margin-top:10px'>Rolling Graph</div>"
              "<div class='graph-stack'>"
              "<canvas id='graph-base'></canvas>"
@@ -278,6 +309,10 @@ static esp_err_t http_root_get(httpd_req_t *req)
              "const graphRoll=document.getElementById('graph-roll');"
              "const graphPitch=document.getElementById('graph-pitch');"
              "const led=document.getElementById('led');"
+             "const overlay=document.getElementById('overlay');"
+             "const overlayW=520,overlayH=536;"
+             "const ledBox={x:69,y:80,w:390,h:400};"
+             "const overlayImg=new Image();"
              "const rollBuf=[],pitchBuf=[];const maxN=120;"
              "function setText(id,v){document.getElementById(id).textContent=v;}"
              "function updateOrientation(){const o=window.innerWidth>window.innerHeight?'landscape':'portrait';"
@@ -315,19 +350,26 @@ static esp_err_t http_root_get(httpd_req_t *req)
              "ctxPitch.font='12px serif';ctxPitch.fillStyle='#8fd8ff';"
              "ctxPitch.fillText(rightLabel,w-ctxPitch.measureText(rightLabel).width-8,16);"
              "}"
+             "function drawOverlay(){"
+             "if(!overlayImg.complete)return;"
+             "overlay.width=overlayW;overlay.height=overlayH;"
+             "const ctx=overlay.getContext('2d');ctx.clearRect(0,0,overlayW,overlayH);"
+             "ctx.drawImage(overlayImg,0,0,overlayW,overlayH);"
+             "}"
              "function hsv(h,s,v){const c=v*s;const x=c*(1-Math.abs(((h/60)%%2)-1));"
              "const m=v-c;let r=0,g=0,b=0;"
              "if(h<60){r=c;g=x;}else if(h<120){r=x;g=c;}else if(h<180){g=c;b=x;}"
              "else if(h<240){g=x;b=c;}else if(h<300){r=x;b=c;}else{r=c;b=x;}"
              "return [Math.round((r+m)*255),Math.round((g+m)*255),Math.round((b+m)*255)];}"
              "function drawLed(d){const ctx=led.getContext('2d');"
-             "const w=led.width=led.clientWidth,h=led.height=led.clientHeight;ctx.clearRect(0,0,w,h);"
-             "const size=Math.min(w,h);const pad=8;const cell=(size-2*pad)/8;"
-             "ctx.fillStyle='#0b141d';ctx.fillRect(0,0,w,h);"
+             "const w=led.width=overlayW,h=led.height=overlayH;ctx.clearRect(0,0,w,h);"
+             "ctx.fillStyle='#ffffff';ctx.fillRect(0,0,w,h);"
+             "const cell=ledBox.w/8;"
              "for(let y=0;y<8;y++){for(let x=0;x<8;x++){"
-             "ctx.strokeStyle='rgba(80,110,140,0.25)';ctx.strokeRect(pad+x*cell,pad+y*cell,cell,cell);}}"
+             "ctx.strokeStyle='rgba(80,110,140,0.25)';"
+             "ctx.strokeRect(ledBox.x+x*cell,ledBox.y+y*cell,cell,cell);}}"
              "function blob(vx,vy,hue,alpha){const fx=vx/4;const fy=vy/4;"
-             "const cx=pad+(fx+0.5)*cell;const cy=pad+(fy+0.5)*cell;"
+             "const cx=ledBox.x+(fx+0.5)*cell;const cy=ledBox.y+(fy+0.5)*cell;"
              "const [r,g,b]=hsv((hue||0)/255*360,1,1);"
              "ctx.fillStyle='rgba('+r+','+g+','+b+','+alpha+')';"
              "ctx.beginPath();ctx.arc(cx,cy,cell*0.7,0,Math.PI*2);ctx.fill();"
@@ -335,6 +377,10 @@ static esp_err_t http_root_get(httpd_req_t *req)
              "ctx.globalAlpha=1;}"
              "if(d.local_vpos)blob(d.local_vpos[0],d.local_vpos[1],d.local_hue,0.9);"
              "if(d.remote_vpos)blob(d.remote_vpos[0],d.remote_vpos[1],d.remote_hue,0.5);"
+             "}"
+             "function loadOverlayAssets(){"
+             "overlayImg.onload=drawOverlay;"
+             "overlayImg.src='/overlay.png';"
              "}"
              "function ingest(d){"
              "setText('mac',d.mac||'-');setText('peer',d.peer||'-');"
@@ -351,6 +397,7 @@ static esp_err_t http_root_get(httpd_req_t *req)
              "drawTilt(d.roll||0,d.pitch||0);drawLed(d);drawGraph();"
              "}"
              "function poll(){fetch('/status').then(r=>r.json()).then(ingest).catch(()=>{});}"
+             "loadOverlayAssets();"
              "setInterval(poll,100);poll();"
              "</script></body></html>");
 
@@ -366,6 +413,28 @@ static esp_err_t http_status_get(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
+}
+
+static esp_err_t http_overlay_png_get(httpd_req_t *req)
+{
+    FILE *f = fopen("/spiffs/overlay.png", "rb");
+    if (!f) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "overlay missing");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "image/png");
+    char buf[2048];
+    size_t read_len = 0;
+    while ((read_len = fread(buf, 1, sizeof(buf), f)) > 0) {
+        esp_err_t err = httpd_resp_send_chunk(req, buf, read_len);
+        if (err != ESP_OK) {
+            fclose(f);
+            httpd_resp_sendstr_chunk(req, NULL);
+            return err;
+        }
+    }
+    fclose(f);
+    return httpd_resp_sendstr_chunk(req, NULL);
 }
 
 static esp_err_t http_pair_clear(httpd_req_t *req)
@@ -393,6 +462,7 @@ static void start_captive_portal(void)
         return;
     }
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.stack_size = 8192;
     config.uri_match_fn = httpd_uri_match_wildcard;
     if (httpd_start(&s_httpd, &config) == ESP_OK) {
         httpd_uri_t root = {
@@ -410,9 +480,15 @@ static void start_captive_portal(void)
             .method = HTTP_GET,
             .handler = http_pair_clear,
         };
+        httpd_uri_t overlay = {
+            .uri = "/overlay.png",
+            .method = HTTP_GET,
+            .handler = http_overlay_png_get,
+        };
         httpd_register_uri_handler(s_httpd, &root);
         httpd_register_uri_handler(s_httpd, &status);
         httpd_register_uri_handler(s_httpd, &clear);
+        httpd_register_uri_handler(s_httpd, &overlay);
         httpd_register_err_handler(s_httpd, HTTPD_404_NOT_FOUND, http_404_handler);
     }
 #endif
@@ -665,8 +741,11 @@ static esp_err_t espnow_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
 
     wifi_config_t ap_cfg = {0};
-    snprintf((char *)ap_cfg.ap.ssid, sizeof(ap_cfg.ap.ssid), "%s", CAPTIVE_AP_SSID);
-    ap_cfg.ap.ssid_len = strlen(CAPTIVE_AP_SSID);
+    uint8_t mac[6] = {0};
+    esp_wifi_get_mac(WIFI_IF_STA, mac);
+    snprintf((char *)ap_cfg.ap.ssid, sizeof(ap_cfg.ap.ssid), "%s-%02X%02X",
+             CAPTIVE_AP_SSID, mac[4], mac[5]);
+    ap_cfg.ap.ssid_len = strlen((char *)ap_cfg.ap.ssid);
     ap_cfg.ap.channel = CAPTIVE_AP_CHANNEL;
     ap_cfg.ap.max_connection = CAPTIVE_AP_MAX_CONN;
     if (CAPTIVE_AP_OPEN) {
@@ -1009,6 +1088,8 @@ void app_main(void)
         nvs_err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(nvs_err);
+
+    init_spiffs();
 
     gpio_config_t gpio_cfg = {
         .pin_bit_mask = 1ULL << LED_STRIP_GPIO,
