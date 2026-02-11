@@ -36,17 +36,26 @@
 #define TILT_GAIN_PITCH      0.85f /* Lower = less sensitive up/down. */
 #define FLOW_INPUT_SMOOTH    0.7f /* Higher = slower response to tilt changes. */
 #define FLOW_RESISTANCE      0.5f /* Higher = more drag, shorter glide. */
-#define VIRTUAL_GRID_SCALE   4.0f /* Higher = smoother sub-pixel motion. */
+#define VIRTUAL_GRID_SCALE   6.0f /* Higher = smoother sub-pixel motion. */
 #define VIRTUAL_BLOB_SCALE   1.6f /* Blob size in virtual-grid units. */
+#define BLOB_COLLIDE_RADIUS  (VIRTUAL_BLOB_SCALE * 1.4f) /* Virtual units. */
+#define BLOB_COLLIDE_PUSH    0.75f /* 0-1, how hard blobs push apart. */
+#define BLOB_COLLIDE_BOUNCE  0.35f /* 0-1, extra bounce on contact. */
+#define RIPPLE_DURATION_MS   700  /* Collision ripple lifetime. */
+#define RIPPLE_HOLDOFF_MS    450  /* Min time between ripple triggers. */
+#define RIPPLE_SPEED_VU      20.0f /* Virtual units per second. */
+#define RIPPLE_THICKNESS_VU  3.0f /* Ring thickness in virtual units. */
+#define RIPPLE_INTENSITY     16 /* Brightness add (0-255). */
+#define RIPPLE_ORGANIC       0.12f /* 0-1, ring wobble amount. */
 
 /* Idle mode */
 #define MOTION_GYRO_SCALE    30000.0f /* Higher = less sensitive motion detect. */
 #define MOTION_ENTER_IDLE    0.5 /* Below this = can enter idle after timeout. */
 #define MOTION_EXIT_IDLE     1.5f /* Above this = exit idle immediately. */
-#define IDLE_TIMEOUT_MS      2500
+#define IDLE_TIMEOUT_MS      5000
 #define IDLE_SPEED           0.22f /* Pixels per frame when idle. */
 #define IDLE_LOCAL_DIM       60  /* 0-255, local trail dimming in idle. */
-#define IDLE_REMOTE_DIM      30   /* 0-255, remote trail dimming in idle. */
+#define IDLE_REMOTE_DIM      45   /* 0-255, remote trail dimming in idle. */
 
 /* Debug */
 #define DEBUG_MOTION_LOGS    1   /* 1 = print IMU/motion state at 2 Hz. */
@@ -67,6 +76,7 @@
 #define ESPNOW_RSSI_TRACK_MS 5000
 #define ESPNOW_MSG_HELLO     1
 #define ESPNOW_MSG_DATA      2
+#define ESPNOW_MSG_RIPPLE    3
 
 /* Captive portal (AP + status page) */
 #define CAPTIVE_PORTAL_ENABLE 1
