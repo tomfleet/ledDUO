@@ -1,4 +1,4 @@
-# LEDDuo
+z# LEDDuo
 
 This is a gratuitous use of Codex to do something fun with some ESP32-S3 dev boards that have been getting dusty.
 
@@ -13,8 +13,8 @@ The code is targeting the [Waveshare ESP32-S3-Matrix](https://www.waveshare.com/
 * There's an auto-ranging RSSI function that averages each other's measured RSSI, scaled to an initial 5s averaging at pairing
 * the RSSI is used to scale the remote/guest brightness of the led sprite on the local screen
 * the sprites will just kinda wander about if they get bored (idle time = DVD screensaver)
-* if a remote board is bored, the locally rendered view of it's data will be dimmed, but still shows it.
-* there's also a dashboard using websockets, on a co-hosted AP 
+* if a remote board is bored, the locally rendered view of it's data will be dimmed, but still shown.
+* there's also a dashboard, using websockets, on a co-hosted AP 
 * dashboard draws motion (pitch/roll) on a dual axis auto-ranging graph
 * dashboard also renders the LED matrix of the AP you are connected to. 
 * dashboard also renders the guest LED data of the AP you are connected to.
