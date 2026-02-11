@@ -10,9 +10,9 @@ The code is targeting the [Waveshare ESP32-S3-Matrix](https://www.waveshare.com/
 * Also, should auto-pair with a 2nd board running the same code.
 * The boards will broadcast and receive each other's LED data, and render both trails
 * There's an auto-ranging RSSI function that averages each other's measured RSSI, scaled to an initial 5s averaging at pairing
-* the RSSI is used to scale the remote/guest led sprite on the local screen
-* the sprites will just kinda wander about if they get board (idle time = DVD screensaver)
-* if a board is idle, the remote board dim's it's data, but still shows it.
+* the RSSI is used to scale the remote/guest brightness of the led sprite on the local screen
+* the sprites will just kinda wander about if they get bored (idle time = DVD screensaver)
+* if a remote board is bored, the locally rendered view of it's data will be dimmed, but still shows it.
 * there's also a dashboard using websockets, on a co-hosted AP 
 * dashboard draws motion (pitch/roll) on a dual axis auto-ranging graph
 * dashboard also renders the LED matrix of the AP you are connected to. 
