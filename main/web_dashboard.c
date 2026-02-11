@@ -80,6 +80,7 @@ static int build_status_json(char *buf, size_t len)
                     "\"idle\":%s,\"motion\":%.3f,\"since_motion_ms\":%lld,"
                     "\"rssi\":%d,\"rssi_min\":%d,\"rssi_max\":%d,\"rssi_track_ms\":%lld,"
                     "\"pairing\":%s,\"pairing_ms\":%lld,"
+                    "\"vscale\":%.2f,"
                     "\"local_vpos\":[%u,%u],\"local_hue\":%u,"
                     "\"remote_vpos\":[%u,%u],\"remote_hue\":%u,"
                     "\"roll\":%.2f,\"pitch\":%.2f}",
@@ -95,6 +96,7 @@ static int build_status_json(char *buf, size_t len)
                     rssi_left_ms,
                     link->pairing_active ? "true" : "false",
                     pair_left_ms,
+                    VIRTUAL_GRID_SCALE,
                     local_vpos_x,
                     local_vpos_y,
                     local_hue,
